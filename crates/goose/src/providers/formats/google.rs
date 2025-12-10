@@ -116,15 +116,38 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                                 if text.is_empty() {
                                     text = "Tool call is done.".to_string();
                                 }
-                                parts.push(json!({
-                                    "functionResponse": {
-                                        "name": response.id,
-                                        "response": {"content": {"text": text}},
-                                    }}
-                                ));
+                                let mut part = Map::new();
+                                let mut function_response = Map::new();
+                                function_response.insert("name".to_string(), json!(response.id));
+                                function_response.insert(
+                                    "response".to_string(),
+                                    json!({"content": {"text": text}}),
+                                );
+                                part.insert(
+                                    "functionResponse".to_string(),
+                                    json!(function_response),
+                                );
+                                if let Some(signature) = &response.thought_signature {
+                                    part.insert("thoughtSignature".to_string(), json!(signature));
+                                }
+                                parts.push(json!(part));
                             }
                             Err(e) => {
-                                parts.push(json!({"text":format!("Error: {}", e)}));
+                                let mut part = Map::new();
+                                let mut function_response = Map::new();
+                                function_response.insert("name".to_string(), json!(response.id));
+                                function_response.insert(
+                                    "response".to_string(),
+                                    json!({"content": {"text": format!("Error: {}", e)}}),
+                                );
+                                part.insert(
+                                    "functionResponse".to_string(),
+                                    json!(function_response),
+                                );
+                                if let Some(signature) = &response.thought_signature {
+                                    part.insert("thoughtSignature".to_string(), json!(signature));
+                                }
+                                parts.push(json!(part));
                             }
                         }
                     }
@@ -281,15 +304,33 @@ pub fn response_to_message(response: Value) -> Result<Message> {
         .and_then(|parts| parts.as_array())
         .unwrap_or(&binding);
 
+    // Track the last seen thought_signature to use as fallback for function calls without one
+    // This handles cases where Google's API returns multiple function calls but only includes
+    // thoughtSignature on some of them
+    let mut last_thought_signature: Option<String> = None;
+
+    // Check if this response contains any function calls
+    // If not, text content should be treated as final response (not thinking)
+    let has_function_calls = parts.iter().any(|p| p.get("functionCall").is_some());
+
     for part in parts {
         let thought_signature = part
             .get("thoughtSignature")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Update the last known signature if this part has one
+        if thought_signature.is_some() {
+            last_thought_signature = thought_signature.clone();
+        }
+
         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            if let Some(sig) = thought_signature {
-                content.push(MessageContent::thinking(text.to_string(), sig));
+            // Text is "thinking" only if:
+            // 1. It has a thought_signature AND
+            // 2. The response also contains function calls (meaning this is reasoning before acting)
+            // If there are no function calls, this is the final response and should be shown
+            if let (Some(sig), true) = (&thought_signature, has_function_calls) {
+                content.push(MessageContent::thinking(text.to_string(), sig.clone()));
             } else {
                 content.push(MessageContent::text(text.to_string()));
             }
@@ -315,16 +356,19 @@ pub fn response_to_message(response: Value) -> Result<Message> {
                 content.push(MessageContent::tool_request(id, Err(error)));
             } else {
                 let parameters = function_call.get("args");
-                if let Some(params) = parameters {
-                    content.push(MessageContent::tool_request_with_signature(
-                        id,
-                        Ok(CallToolRequestParam {
-                            name: name.into(),
-                            arguments: Some(object(params.clone())),
-                        }),
-                        thought_signature,
-                    ));
-                }
+                let arguments = parameters.map(|params| object(params.clone()));
+                // Use the part's thought_signature if available, otherwise fall back to the last known one
+                let effective_signature = thought_signature
+                    .as_deref()
+                    .or(last_thought_signature.as_deref());
+                content.push(MessageContent::tool_request_with_signature(
+                    id,
+                    Ok(CallToolRequestParam {
+                        name: name.into(),
+                        arguments,
+                    }),
+                    effective_signature,
+                ));
             }
         }
     }
@@ -912,5 +956,187 @@ mod tests {
         let regular_field = &result[0]["parameters"]["properties"]["regular_field"];
         assert_eq!(regular_field["type"], "number");
         assert_eq!(regular_field["description"], "A regular number field");
+    }
+
+    #[test]
+    fn test_response_to_message_text_only_with_thought_signature_is_text() {
+        // When response has only text (no function calls), it should be regular text
+        // even if it has a thoughtSignature (this is the final response)
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "text": "Here is my final answer.",
+                        "thoughtSignature": "sig123"
+                    }]
+                }
+            }]
+        });
+        let message = response_to_message(response).unwrap();
+        assert_eq!(message.content.len(), 1);
+        match &message.content[0] {
+            MessageContent::Text(t) => assert_eq!(t.text, "Here is my final answer."),
+            _ => panic!("Expected Text content, got {:?}", message.content[0]),
+        }
+    }
+
+    #[test]
+    fn test_response_to_message_text_with_function_call_is_thinking() {
+        // When response has text AND function calls, the text is thinking content
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "text": "Let me think about this...",
+                            "thoughtSignature": "sig123"
+                        },
+                        {
+                            "functionCall": {
+                                "name": "shell",
+                                "args": {"command": "ls"}
+                            },
+                            "thoughtSignature": "sig123"
+                        }
+                    ]
+                }
+            }]
+        });
+        let message = response_to_message(response).unwrap();
+        assert_eq!(message.content.len(), 2);
+        match &message.content[0] {
+            MessageContent::Thinking(t) => {
+                assert_eq!(t.thinking, "Let me think about this...");
+                assert_eq!(t.signature, "sig123");
+            }
+            _ => panic!("Expected Thinking content, got {:?}", message.content[0]),
+        }
+        match &message.content[1] {
+            MessageContent::ToolRequest(req) => {
+                assert_eq!(req.thought_signature, Some("sig123".to_string()));
+            }
+            _ => panic!("Expected ToolRequest, got {:?}", message.content[1]),
+        }
+    }
+
+    #[test]
+    fn test_response_to_message_function_call_inherits_thought_signature() {
+        // When multiple function calls exist but only some have thoughtSignature,
+        // the signature should be carried forward
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "tool1",
+                                "args": {}
+                            },
+                            "thoughtSignature": "sig_first"
+                        },
+                        {
+                            "functionCall": {
+                                "name": "tool2",
+                                "args": {}
+                            }
+                            // No thoughtSignature - should inherit from previous
+                        }
+                    ]
+                }
+            }]
+        });
+        let message = response_to_message(response).unwrap();
+        assert_eq!(message.content.len(), 2);
+
+        // First tool call has its own signature
+        if let MessageContent::ToolRequest(req) = &message.content[0] {
+            assert_eq!(req.thought_signature, Some("sig_first".to_string()));
+        } else {
+            panic!("Expected ToolRequest");
+        }
+
+        // Second tool call inherits the signature
+        if let MessageContent::ToolRequest(req) = &message.content[1] {
+            assert_eq!(req.thought_signature, Some("sig_first".to_string()));
+        } else {
+            panic!("Expected ToolRequest");
+        }
+    }
+
+    #[test]
+    fn test_format_messages_includes_thought_signature_in_tool_response() {
+        // Tool responses with thought_signature should include it in the payload
+        let message = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContent::tool_response_with_signature(
+                "tool_id",
+                Ok(vec![Content::text("result")]),
+                Some("sig_response"),
+            )],
+        );
+        let payload = format_messages(&[message]);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0]["parts"][0]["thoughtSignature"], "sig_response");
+    }
+
+    #[test]
+    fn test_format_messages_omits_thought_signature_when_none() {
+        // Tool responses without thought_signature should not include it
+        let message = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContent::tool_response(
+                "tool_id".to_string(),
+                Ok(vec![Content::text("result")]),
+            )],
+        );
+        let payload = format_messages(&[message]);
+        assert_eq!(payload.len(), 1);
+        assert!(payload[0]["parts"][0].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn test_format_messages_handles_tool_response_error_correctly() {
+        // Tool responses that are errors should be formatted as valid functionResponse
+        // with the error message in content, and include thought signature
+        let error_msg = "Tool execution failed";
+        let error_data = ErrorData {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(error_msg),
+            data: None,
+        };
+        // Clone for assertion later
+        let e_ref = error_data.clone();
+
+        let message = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContent::tool_response_with_signature(
+                "tool_id",
+                Err(error_data),
+                Some("sig_error"),
+            )],
+        );
+        let payload = format_messages(&[message]);
+        assert_eq!(payload.len(), 1);
+
+        let part = &payload[0]["parts"][0];
+
+        // Should have thoughtSignature
+        assert_eq!(part["thoughtSignature"], "sig_error");
+
+        // Should be a functionResponse, not a text part
+        assert!(part.get("functionResponse").is_some());
+
+        let response = &part["functionResponse"];
+        assert_eq!(response["name"], "tool_id");
+        assert_eq!(
+            response["response"]["content"]["text"],
+            format!("Error: {}", e_ref)
+        );
     }
 }

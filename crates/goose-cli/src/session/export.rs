@@ -580,6 +580,7 @@ mod tests {
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "test-id".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -600,6 +601,7 @@ mod tests {
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "test-id".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -706,6 +708,7 @@ if __name__ == "__main__":
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "shell-cat".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -747,6 +750,7 @@ if __name__ == "__main__":
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "git-status".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -796,6 +800,7 @@ warning: unused variable `x`
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "cargo-build".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -843,6 +848,7 @@ warning: unused variable `x`
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "curl-api".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -879,6 +885,7 @@ warning: unused variable `x`
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "editor-write".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -936,6 +943,7 @@ def process_data(data: List[Dict]) -> List[Dict]:
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "editor-view".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -973,6 +981,7 @@ Command failed with exit code 2"#;
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "shell-error".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -1013,6 +1022,7 @@ Command failed with exit code 2"#;
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "script-exec".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -1060,6 +1070,7 @@ drwx------   3 user  staff    96 Dec  6 16:20 com.apple.launchd.abc
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "multi-cmd".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -1103,6 +1114,7 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "grep-search".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -1143,6 +1155,7 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "json-test".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };
@@ -1184,6 +1197,7 @@ found 0 vulnerabilities"#;
             annotations: None,
         };
         let tool_response = ToolResponse {
+            thought_signature: None,
             id: "npm-install".to_string(),
             tool_result: Ok(vec![Content::text(text_content.raw.text)]),
         };

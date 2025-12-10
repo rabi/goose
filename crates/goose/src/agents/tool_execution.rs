@@ -120,9 +120,10 @@ impl Agent {
                             // User declined - update the specific response message for this request
                             if let Some(response_msg) = request_to_response_map.get(&request.id) {
                                 let mut response = response_msg.lock().await;
-                                *response = response.clone().with_tool_response(
+                                *response = response.clone().with_tool_response_with_signature(
                                     request.id.clone(),
                                     Ok(vec![Content::text(DECLINED_RESPONSE)]),
+                                    request.thought_signature.as_deref(),
                                 );
                             }
                         }
@@ -150,7 +151,11 @@ impl Agent {
 
                         if let Some((id, result)) = self.tool_result_rx.lock().await.recv().await {
                             let mut response = message_tool_response.lock().await;
-                            *response = response.clone().with_tool_response(id, result);
+                            *response = response.clone().with_tool_response_with_signature(
+                                id,
+                                result,
+                                tool_request.thought_signature.as_deref(),
+                            );
                         }
                     }
             }

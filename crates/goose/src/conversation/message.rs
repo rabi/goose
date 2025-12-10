@@ -89,6 +89,8 @@ pub struct ToolResponse {
     #[serde(with = "tool_result_serde")]
     #[schema(value_type = Object)]
     pub tool_result: ToolResult<Vec<Content>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,15 +256,15 @@ impl MessageContent {
         })
     }
 
-    pub fn tool_request_with_signature<S1: Into<String>, S2: Into<String>>(
-        id: S1,
+    pub fn tool_request_with_signature<S: Into<String>>(
+        id: S,
         tool_call: ToolResult<CallToolRequestParam>,
-        thought_signature: Option<S2>,
+        thought_signature: Option<&str>,
     ) -> Self {
         MessageContent::ToolRequest(ToolRequest {
             id: id.into(),
             tool_call,
-            thought_signature: thought_signature.map(|s| s.into()),
+            thought_signature: thought_signature.map(|s| s.to_string()),
         })
     }
 
@@ -270,6 +272,19 @@ impl MessageContent {
         MessageContent::ToolResponse(ToolResponse {
             id: id.into(),
             tool_result,
+            thought_signature: None,
+        })
+    }
+
+    pub fn tool_response_with_signature<S: Into<String>>(
+        id: S,
+        tool_result: ToolResult<Vec<Content>>,
+        thought_signature: Option<&str>,
+    ) -> Self {
+        MessageContent::ToolResponse(ToolResponse {
+            id: id.into(),
+            tool_result,
+            thought_signature: thought_signature.map(|s| s.to_string()),
         })
     }
 
@@ -640,6 +655,20 @@ impl Message {
         self.with_content(MessageContent::tool_request(id, tool_call))
     }
 
+    /// Add a tool request with thought signature to the message
+    pub fn with_tool_request_with_signature<S: Into<String>>(
+        self,
+        id: S,
+        tool_call: ToolResult<CallToolRequestParam>,
+        thought_signature: Option<&str>,
+    ) -> Self {
+        self.with_content(MessageContent::tool_request_with_signature(
+            id,
+            tool_call,
+            thought_signature,
+        ))
+    }
+
     /// Add a tool response to the message
     pub fn with_tool_response<S: Into<String>>(
         self,
@@ -647,6 +676,20 @@ impl Message {
         result: ToolResult<Vec<Content>>,
     ) -> Self {
         self.with_content(MessageContent::tool_response(id, result))
+    }
+
+    /// Add a tool response with thought signature to the message
+    pub fn with_tool_response_with_signature<S: Into<String>>(
+        self,
+        id: S,
+        result: ToolResult<Vec<Content>>,
+        thought_signature: Option<&str>,
+    ) -> Self {
+        self.with_content(MessageContent::tool_response_with_signature(
+            id,
+            result,
+            thought_signature,
+        ))
     }
 
     /// Add an action required message for tool confirmation

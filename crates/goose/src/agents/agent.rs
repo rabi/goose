@@ -358,9 +358,10 @@ impl Agent {
         for request in &permission_check_result.denied {
             if let Some(response_msg) = request_to_response_map.get(&request.id) {
                 let mut response = response_msg.lock().await;
-                *response = response.clone().with_tool_response(
+                *response = response.clone().with_tool_response_with_signature(
                     request.id.clone(),
                     Ok(vec![rmcp::model::Content::text(DECLINED_RESPONSE)]),
+                    request.thought_signature.as_deref(),
                 );
             }
         }
@@ -1069,8 +1070,10 @@ impl Agent {
                                     .collect();
 
                                 let mut request_to_response_map = HashMap::new();
+                                let mut request_signatures: HashMap<String, Option<String>> = HashMap::new();
                                 for (idx, request) in frontend_requests.iter().chain(remaining_requests.iter()).enumerate() {
                                     request_to_response_map.insert(request.id.clone(), tool_response_messages[idx].clone());
+                                    request_signatures.insert(request.id.clone(), request.thought_signature.clone());
                                 }
 
                                 for (idx, request) in frontend_requests.iter().enumerate() {
@@ -1088,9 +1091,10 @@ impl Agent {
                                     for request in remaining_requests.iter() {
                                         if let Some(response_msg) = request_to_response_map.get(&request.id) {
                                             let mut response = response_msg.lock().await;
-                                            *response = response.clone().with_tool_response(
+                                            *response = response.clone().with_tool_response_with_signature(
                                                 request.id.clone(),
                                                 Ok(vec![Content::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)]),
+                                                request.thought_signature.as_deref(),
                                             );
                                         }
                                     }
@@ -1182,8 +1186,9 @@ impl Agent {
                                                     all_install_successful = false;
                                                 }
                                                 if let Some(response_msg) = request_to_response_map.get(&request_id) {
+                                                    let signature = request_signatures.get(&request_id).and_then(|s| s.as_deref());
                                                     let mut response = response_msg.lock().await;
-                                                    *response = response.clone().with_tool_response(request_id, output);
+                                                    *response = response.clone().with_tool_response_with_signature(request_id, output, signature);
                                                 }
                                             }
                                             ToolStreamItem::Message(msg) => {
@@ -1209,7 +1214,11 @@ impl Agent {
                                     if request.tool_call.is_ok() {
                                         let request_msg = Message::assistant()
                                             .with_id(format!("msg_{}", Uuid::new_v4()))
-                                            .with_tool_request(request.id.clone(), request.tool_call.clone());
+                                            .with_tool_request_with_signature(
+                                                request.id.clone(),
+                                                request.tool_call.clone(),
+                                                request.thought_signature.as_deref(),
+                                            );
                                         messages_to_add.push(request_msg);
                                         let final_response = tool_response_messages[idx]
                                                                 .lock().await.clone();

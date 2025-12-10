@@ -948,6 +948,7 @@ export type ToolRequest = {
 
 export type ToolResponse = {
     id: string;
+    thoughtSignature?: string | null;
     toolResult: {
         [key: string]: unknown;
     };

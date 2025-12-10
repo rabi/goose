@@ -5390,6 +5390,10 @@
           "id": {
             "type": "string"
           },
+          "thoughtSignature": {
+            "type": "string",
+            "nullable": true
+          },
           "toolResult": {
             "type": "object"
           }
