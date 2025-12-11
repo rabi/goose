@@ -8,6 +8,8 @@ pub enum McpCommand {
     AutoVisualiser,
     ComputerController,
     Developer,
+    Github,
+    Jira,
     Memory,
     Tutorial,
 }
@@ -20,6 +22,8 @@ impl FromStr for McpCommand {
             "autovisualiser" => Ok(McpCommand::AutoVisualiser),
             "computercontroller" => Ok(McpCommand::ComputerController),
             "developer" => Ok(McpCommand::Developer),
+            "github" => Ok(McpCommand::Github),
+            "jira" => Ok(McpCommand::Jira),
             "memory" => Ok(McpCommand::Memory),
             "tutorial" => Ok(McpCommand::Tutorial),
             _ => Err(format!("Invalid command: {}", s)),
@@ -32,6 +36,8 @@ impl McpCommand {
         match self {
             McpCommand::AutoVisualiser => "autovisualiser",
             McpCommand::ComputerController => "computercontroller",
+            McpCommand::Github => "github",
+            McpCommand::Jira => "jira",
             McpCommand::Developer => "developer",
             McpCommand::Memory => "memory",
             McpCommand::Tutorial => "tutorial",

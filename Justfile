@@ -119,10 +119,18 @@ copy-binary-windows:
         exit 1; \
     }"
 
-# Run UI with latest
+# Run UI with latest (release build)
 run-ui:
     @just release-binary
     @echo "Running UI..."
+    cd ui/desktop && npm install && npm run start-gui
+
+# Run UI with dev build (faster iteration)
+run-ui-dev:
+    @echo "Building debug version..."
+    cargo build
+    @just copy-binary "debug"
+    @echo "Running UI with dev build..."
     cd ui/desktop && npm install && npm run start-gui
 
 run-ui-playwright:

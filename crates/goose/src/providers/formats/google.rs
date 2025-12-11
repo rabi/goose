@@ -226,6 +226,24 @@ pub fn process_value(value: &Value, parent_key: Option<&str>) -> Value {
 pub fn process_map(map: &Map<String, Value>, parent_key: Option<&str>) -> Value {
     let accepted_keys = get_accepted_keys(parent_key);
 
+    // First pass: collect valid property names if processing properties
+    let valid_property_names: std::collections::HashSet<String> =
+        if let Some(props) = map.get("properties").and_then(|v| v.as_object()) {
+            props
+                .iter()
+                .filter_map(|(prop_key, prop_value)| {
+                    // Only include properties that are valid schema objects
+                    if prop_value.is_object() {
+                        Some(prop_key.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
     let filtered_map: Map<String, Value> = map
         .iter()
         .filter_map(|(key, value)| {
@@ -238,15 +256,50 @@ pub fn process_map(map: &Map<String, Value>, parent_key: Option<&str>) -> Value 
                     if let Some(nested_map) = value.as_object() {
                         let processed_properties: Map<String, Value> = nested_map
                             .iter()
-                            .map(|(prop_key, prop_value)| {
+                            .filter_map(|(prop_key, prop_value)| {
                                 if let Some(prop_obj) = prop_value.as_object() {
-                                    (prop_key.clone(), process_map(prop_obj, Some("properties")))
+                                    Some((
+                                        prop_key.clone(),
+                                        process_map(prop_obj, Some("properties")),
+                                    ))
                                 } else {
-                                    (prop_key.clone(), prop_value.clone())
+                                    // Skip invalid property values (e.g., `true` instead of schema object)
+                                    tracing::warn!(
+                                        "Skipping invalid schema property '{}' with non-object value: {:?}",
+                                        prop_key,
+                                        prop_value
+                                    );
+                                    None
                                 }
                             })
                             .collect();
                         Value::Object(processed_properties)
+                    } else {
+                        value.clone()
+                    }
+                }
+                "required" => {
+                    // Filter required array to only include properties that exist
+                    if let Some(arr) = value.as_array() {
+                        let filtered_required: Vec<Value> = arr
+                            .iter()
+                            .filter(|item| {
+                                if let Some(prop_name) = item.as_str() {
+                                    let exists = valid_property_names.contains(prop_name);
+                                    if !exists && !valid_property_names.is_empty() {
+                                        tracing::warn!(
+                                            "Removing '{}' from required array - property was filtered out",
+                                            prop_name
+                                        );
+                                    }
+                                    exists
+                                } else {
+                                    true // Keep non-string items as-is
+                                }
+                            })
+                            .cloned()
+                            .collect();
+                        Value::Array(filtered_required)
                     } else {
                         value.clone()
                     }

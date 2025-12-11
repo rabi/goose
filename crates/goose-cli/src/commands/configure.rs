@@ -707,7 +707,7 @@ pub fn configure_extensions_dialog() -> anyhow::Result<()> {
     match extension_type {
         // TODO we'll want a place to collect all these options, maybe just an enum in goose-mcp
         "built-in" => {
-            let extensions = vec![
+            let mut extensions = vec![
                 (
                     "autovisualiser",
                     "Auto Visualiser",
@@ -735,6 +735,16 @@ pub fn configure_extensions_dialog() -> anyhow::Result<()> {
                 ),
             ];
 
+            extensions.push((
+                "github",
+                "Github Extension",
+                "Tools for interacting with Github (Issues, PRs, etc)",
+            ));
+            extensions.push((
+                "jira",
+                "Jira Extension",
+                "Tools for interacting with Jira (Issues, Comments, etc)",
+            ));
             let mut select = cliclack::select("Which built-in extension would you like to enable?");
             for (id, name, desc) in &extensions {
                 select = select.item(id, name, desc);

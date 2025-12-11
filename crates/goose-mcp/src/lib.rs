@@ -10,9 +10,13 @@ pub static APP_STRATEGY: Lazy<AppStrategyArgs> = Lazy::new(|| AppStrategyArgs {
 pub mod autovisualiser;
 pub mod computercontroller;
 pub mod developer;
+pub mod github;
+pub mod jira;
 pub mod mcp_server_runner;
 mod memory;
 pub mod tutorial;
+pub use github::GithubServer;
+pub use jira::JiraServer;
 
 pub use autovisualiser::AutoVisualiserRouter;
 pub use computercontroller::ComputerControllerServer;
