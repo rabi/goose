@@ -1,16 +1,25 @@
 use super::api_client::{ApiClient, AuthMethod};
+use super::base::MessageStream;
 use super::errors::ProviderError;
 use super::retry::ProviderRetry;
-use super::utils::{handle_response_google_compat, unescape_json_values, RequestLog};
+use super::utils::{
+    handle_response_google_compat, handle_status_openai_compat, unescape_json_values, RequestLog,
+};
 use crate::conversation::message::Message;
 
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage};
-use crate::providers::formats::google::{create_request, get_usage, response_to_message};
+use crate::providers::formats::google::{
+    create_request, get_usage, response_to_message, response_to_streaming_message,
+};
 use anyhow::Result;
+use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use rmcp::model::Tool;
 use serde_json::Value;
+use tokio::pin;
+use tokio_stream::StreamExt;
 
 pub const GOOGLE_API_HOST: &str = "https://generativelanguage.googleapis.com";
 pub const GOOGLE_DEFAULT_MODEL: &str = "gemini-2.5-pro";
@@ -84,6 +93,16 @@ impl GoogleProvider {
         let response = self.api_client.response_post(&path, payload).await?;
         handle_response_google_compat(response).await
     }
+
+    async fn post_stream(
+        &self,
+        model_name: &str,
+        payload: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let path = format!("v1beta/models/{}:streamGenerateContent", model_name);
+        let response = self.api_client.response_post(&path, payload).await?;
+        handle_status_openai_compat(response).await
+    }
 }
 
 #[async_trait]
@@ -126,19 +145,16 @@ impl Provider for GoogleProvider {
         let mut log = RequestLog::start(model_config, &payload)?;
 
         let response = self
-            .with_retry(|| async {
-                let payload_clone = payload.clone();
-                self.post(&model_config.model_name, &payload_clone).await
-            })
+            .with_retry(|| async { self.post(&model_config.model_name, &payload).await })
             .await?;
 
-        let message = response_to_message(unescape_json_values(&response))?;
         let usage = get_usage(&response)?;
         let response_model = match response.get("modelVersion") {
             Some(model_version) => model_version.as_str().unwrap_or_default().to_string(),
             None => model_config.model_name.clone(),
         };
         log.write(&response, Some(&usage))?;
+        let message = response_to_message(unescape_json_values(response))?;
         let provider_usage = ProviderUsage::new(response_model, usage);
         Ok((message, provider_usage))
     }
@@ -157,5 +173,42 @@ impl Provider for GoogleProvider {
             .collect();
         models.sort();
         Ok(Some(models))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let payload = create_request(&self.model, system, messages, tools)?;
+        let mut log = RequestLog::start(&self.model, &payload)?;
+
+        let response = self
+            .with_retry(|| async { self.post_stream(&self.model.model_name, &payload).await })
+            .await
+            .inspect_err(|e| {
+                let _ = log.error(e);
+            })?;
+
+        let byte_stream = response.bytes_stream().map_err(anyhow::Error::from);
+
+        Ok(Box::pin(try_stream! {
+            let message_stream = response_to_streaming_message(byte_stream);
+            pin!(message_stream);
+            while let Some(message) = message_stream.next().await {
+                let (message, usage) = message.map_err(|e|
+                    ProviderError::RequestFailed(format!("Stream decode error: {}", e))
+                )?;
+                if message.is_some() || usage.is_some() {
+                    log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
+                }
+                yield (message, usage);
+            }
+        }))
     }
 }

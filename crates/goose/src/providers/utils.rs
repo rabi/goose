@@ -12,12 +12,13 @@ use regex::Regex;
 use reqwest::{Response, StatusCode};
 use rmcp::model::{AnnotateAble, ImageContent, RawImageContent};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::fmt::Display;
 use std::fs::File;
 use std::io;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::pin;
 use tokio_stream::StreamExt;
@@ -324,12 +325,14 @@ pub async fn handle_response_google_compat(response: Response) -> Result<Value, 
 }
 
 pub fn sanitize_function_name(name: &str) -> String {
-    let re = Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9_-]").unwrap());
     re.replace_all(name, "_").to_string()
 }
 
 pub fn is_valid_function_name(name: &str) -> bool {
-    let re = Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap();
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
     re.is_match(name)
 }
 
@@ -434,32 +437,90 @@ pub fn load_image_file(path: &str) -> Result<ImageContent, ProviderError> {
     .no_annotation())
 }
 
-pub fn unescape_json_values(value: &Value) -> Value {
+pub fn unescape_json_values(mut value: Value) -> Value {
+    unescape_json_values_in_place(&mut value);
+    value
+}
+
+fn unescape_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                match chars.peek() {
+                    Some('n') => {
+                        chars.next();
+                        result.push('\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        result.push('\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        result.push('\r');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        result.push('"');
+                    }
+                    _ => {
+                        result.push('\\');
+                        result.push('\\');
+                    }
+                }
+            } else {
+                match chars.peek() {
+                    Some('n') => {
+                        chars.next();
+                        result.push('\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        result.push('\t');
+                    }
+                    Some('r') => {
+                        chars.next();
+                        result.push('\r');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        result.push('"');
+                    }
+                    _ => {
+                        result.push('\\');
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+fn unescape_json_values_in_place(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            let new_map: Map<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), unescape_json_values(v))) // Process each value
-                .collect();
-            Value::Object(new_map)
+            for v in map.values_mut() {
+                unescape_json_values_in_place(v);
+            }
         }
         Value::Array(arr) => {
-            let new_array: Vec<Value> = arr.iter().map(unescape_json_values).collect();
-            Value::Array(new_array)
+            for v in arr.iter_mut() {
+                unescape_json_values_in_place(v);
+            }
         }
         Value::String(s) => {
-            let unescaped = s
-                .replace("\\\\n", "\n")
-                .replace("\\\\t", "\t")
-                .replace("\\\\r", "\r")
-                .replace("\\\\\"", "\"")
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\r", "\r")
-                .replace("\\\"", "\"");
-            Value::String(unescaped)
+            if s.contains('\\') {
+                *s = unescape_string(s);
+            }
         }
-        _ => value.clone(),
+        _ => {}
     }
 }
 
@@ -732,35 +793,31 @@ mod tests {
 
     #[test]
     fn unescape_json_values_with_object() {
-        let value = json!({"text": "Hello\\nWorld"});
-        let unescaped_value = unescape_json_values(&value);
+        let unescaped_value = unescape_json_values(json!({"text": "Hello\\nWorld"}));
         assert_eq!(unescaped_value, json!({"text": "Hello\nWorld"}));
     }
 
     #[test]
     fn unescape_json_values_with_array() {
-        let value = json!(["Hello\\nWorld", "Goodbye\\tWorld"]);
-        let unescaped_value = unescape_json_values(&value);
+        let unescaped_value = unescape_json_values(json!(["Hello\\nWorld", "Goodbye\\tWorld"]));
         assert_eq!(unescaped_value, json!(["Hello\nWorld", "Goodbye\tWorld"]));
     }
 
     #[test]
     fn unescape_json_values_with_string() {
-        let value = json!("Hello\\nWorld");
-        let unescaped_value = unescape_json_values(&value);
+        let unescaped_value = unescape_json_values(json!("Hello\\nWorld"));
         assert_eq!(unescaped_value, json!("Hello\nWorld"));
     }
 
     #[test]
     fn unescape_json_values_with_mixed_content() {
-        let value = json!({
+        let unescaped_value = unescape_json_values(json!({
             "text": "Hello\\nWorld\\\\n!",
             "array": ["Goodbye\\tWorld", "See you\\rlater"],
             "nested": {
                 "inner_text": "Inner\\\"Quote\\\""
             }
-        });
-        let unescaped_value = unescape_json_values(&value);
+        }));
         assert_eq!(
             unescaped_value,
             json!({
@@ -775,8 +832,7 @@ mod tests {
 
     #[test]
     fn unescape_json_values_with_no_escapes() {
-        let value = json!({"text": "Hello World"});
-        let unescaped_value = unescape_json_values(&value);
+        let unescaped_value = unescape_json_values(json!({"text": "Hello World"}));
         assert_eq!(unescaped_value, json!({"text": "Hello World"}));
     }
 

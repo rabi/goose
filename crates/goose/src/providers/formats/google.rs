@@ -3,11 +3,13 @@ use crate::providers::base::Usage;
 use crate::providers::errors::ProviderError;
 use crate::providers::utils::{is_valid_function_name, sanitize_function_name};
 use anyhow::Result;
-use rand::{distributions::Alphanumeric, Rng};
 use rmcp::model::{
     object, AnnotateAble, CallToolRequestParam, ErrorCode, ErrorData, RawContent, Role, Tool,
 };
+use serde::Serialize;
 use std::borrow::Cow;
+use tokio_util::bytes::Bytes;
+use uuid::Uuid;
 
 use crate::conversation::message::{Message, MessageContent, ProviderMetadata};
 use serde_json::{json, Map, Value};
@@ -306,87 +308,125 @@ pub fn process_map(map: &Map<String, Value>, parent_key: Option<&str>) -> Value 
     Value::Object(filtered_map)
 }
 
+#[derive(Clone, Copy)]
+enum SignedTextHandling {
+    SkipSignedText,
+    SignedTextAsThinking,
+    SignedTextAsRegularText,
+}
+
+pub fn process_response_part(
+    part: &Value,
+    last_signature: &mut Option<String>,
+) -> Option<MessageContent> {
+    // For streaming: skip text with signatures (matches Anthropic/OpenAI behavior)
+    process_response_part_impl(part, last_signature, SignedTextHandling::SkipSignedText)
+}
+
+fn process_response_part_non_streaming(
+    part: &Value,
+    last_signature: &mut Option<String>,
+    has_function_calls: bool,
+) -> Option<MessageContent> {
+    // For non-streaming: signed text is thinking only if there are function calls
+    let handling = if has_function_calls {
+        SignedTextHandling::SignedTextAsThinking
+    } else {
+        SignedTextHandling::SignedTextAsRegularText
+    };
+    process_response_part_impl(part, last_signature, handling)
+}
+
+fn process_response_part_impl(
+    part: &Value,
+    last_signature: &mut Option<String>,
+    signed_text_handling: SignedTextHandling,
+) -> Option<MessageContent> {
+    let signature = part.get(THOUGHT_SIGNATURE_KEY).and_then(|v| v.as_str());
+
+    if let Some(sig) = signature {
+        *last_signature = Some(sig.to_string());
+    }
+
+    let text_value = part.get("text");
+    if let Some(text) = text_value.and_then(|v| v.as_str()) {
+        if text.is_empty() {
+            return None;
+        }
+        match (signature, signed_text_handling) {
+            (Some(_), SignedTextHandling::SkipSignedText) => None,
+            (Some(sig), SignedTextHandling::SignedTextAsThinking) => {
+                Some(MessageContent::thinking(text.to_string(), sig.to_string()))
+            }
+            _ => Some(MessageContent::text(text.to_string())),
+        }
+    } else if text_value.is_some() {
+        tracing::warn!(
+            "Google response part has 'text' field but it's not a string: {:?}",
+            text_value
+        );
+        None
+    } else if let Some(function_call) = part.get("functionCall") {
+        let id = Uuid::new_v4().to_string();
+        let name = function_call["name"].as_str().unwrap_or_default();
+
+        if !is_valid_function_name(name) {
+            let error = ErrorData {
+                code: ErrorCode::INVALID_REQUEST,
+                message: Cow::from(format!(
+                    "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
+                    name
+                )),
+                data: None,
+            };
+            Some(MessageContent::tool_request(id, Err(error)))
+        } else {
+            let arguments = function_call
+                .get("args")
+                .map(|params| object(params.clone()));
+            let effective_signature = signature.or(last_signature.as_deref());
+            let metadata = effective_signature.map(metadata_with_signature);
+
+            Some(MessageContent::tool_request_with_metadata(
+                id,
+                Ok(CallToolRequestParam {
+                    name: name.to_string().into(),
+                    arguments,
+                }),
+                metadata.as_ref(),
+            ))
+        }
+    } else {
+        None
+    }
+}
+
 pub fn response_to_message(response: Value) -> Result<Message> {
-    let mut content = Vec::new();
-    let binding = vec![];
-    let candidates: &Vec<Value> = response
-        .get("candidates")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&binding);
-    let candidate = candidates.first();
     let role = Role::Assistant;
     let created = chrono::Utc::now().timestamp();
-    if candidate.is_none() {
-        return Ok(Message::new(role, created, content));
-    }
-    let candidate = candidate.unwrap();
-    let parts = candidate
-        .get("content")
-        .and_then(|content| content.get("parts"))
-        .and_then(|parts| parts.as_array())
-        .unwrap_or(&binding);
 
-    // Track the last seen thought signature to use as fallback for function calls without one
-    // This handles cases where Google's API returns multiple function calls but only includes
-    // thoughtSignature on some of them
-    let mut last_signature: Option<String> = None;
+    let parts = response
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array());
+
+    let Some(parts) = parts else {
+        return Ok(Message::new(role, created, Vec::new()));
+    };
 
     let has_function_calls = parts.iter().any(|p| p.get("functionCall").is_some());
 
+    let mut content = Vec::new();
+    let mut last_signature: Option<String> = None;
+
     for part in parts {
-        let signature = part
-            .get(THOUGHT_SIGNATURE_KEY)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        if signature.is_some() {
-            last_signature = signature.clone();
-        }
-
-        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            // Text is "thinking" only if:
-            // 1. It has a signature AND
-            // 2. The response also contains function calls (meaning this is reasoning before acting)
-            // If there are no function calls, this is the final response and should be shown
-            if let (Some(sig), true) = (&signature, has_function_calls) {
-                content.push(MessageContent::thinking(text.to_string(), sig.clone()));
-            } else {
-                content.push(MessageContent::text(text.to_string()));
-            }
-        } else if let Some(function_call) = part.get("functionCall") {
-            let id: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(8)
-                .map(char::from)
-                .collect();
-            let name = function_call["name"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            if !is_valid_function_name(&name) {
-                let error = ErrorData {
-                    code: ErrorCode::INVALID_REQUEST,
-                    message: Cow::from(format!(
-                        "The provided function name '{}' had invalid characters, it must match this regex [a-zA-Z0-9_-]+",
-                        name
-                    )),
-                    data: None,
-                };
-                content.push(MessageContent::tool_request(id, Err(error)));
-            } else {
-                let parameters = function_call.get("args");
-                let arguments = parameters.map(|params| object(params.clone()));
-                let effective_signature = signature.as_deref().or(last_signature.as_deref());
-                let metadata = effective_signature.map(metadata_with_signature);
-                content.push(MessageContent::tool_request_with_metadata(
-                    id,
-                    Ok(CallToolRequestParam {
-                        name: name.into(),
-                        arguments,
-                    }),
-                    metadata.as_ref(),
-                ));
-            }
+        if let Some(msg_content) =
+            process_response_part_non_streaming(part, &mut last_signature, has_function_calls)
+        {
+            content.push(msg_content);
         }
     }
     Ok(Message::new(role, created, content))
@@ -418,37 +458,241 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
     }
 }
 
-/// Create a complete request payload for Google's API
+use std::io;
+use tokio_util::bytes::BytesMut;
+use tokio_util::codec::Decoder;
+
+#[derive(Default)]
+pub struct GoogleJsonDecoder {
+    cursor: usize,
+    depth: i32,
+    start_idx: Option<usize>,
+    in_string: bool,
+    escape_next: bool,
+}
+
+impl Decoder for GoogleJsonDecoder {
+    type Item = Value;
+    type Error = io::Error;
+
+    #[allow(clippy::string_slice)] // char_indices() returns valid UTF-8 boundary indices
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let valid_len = match std::str::from_utf8(src) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+
+        if valid_len == 0 {
+            return Ok(None);
+        }
+
+        // SAFETY: valid_len is either the full length (valid UTF-8) or valid_up_to (partial valid UTF-8)
+        let valid_str = unsafe { std::str::from_utf8_unchecked(&src[..valid_len]) };
+
+        for (idx, c) in valid_str[self.cursor..].char_indices() {
+            let abs_idx = self.cursor + idx;
+
+            if self.escape_next {
+                self.escape_next = false;
+                continue;
+            }
+            if c == '\\' && self.in_string {
+                self.escape_next = true;
+                continue;
+            }
+            if c == '"' {
+                self.in_string = !self.in_string;
+                continue;
+            }
+            if self.in_string {
+                continue;
+            }
+
+            match c {
+                '{' => {
+                    if self.depth == 0 {
+                        self.start_idx = Some(abs_idx);
+                    }
+                    self.depth += 1;
+                }
+                '}' => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        if let Some(start) = self.start_idx {
+                            let end = abs_idx + c.len_utf8();
+                            let json_str = &valid_str[start..end];
+                            let value: Value = serde_json::from_str(json_str)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                            let _ = src.split_to(end);
+                            self.cursor = 0;
+                            self.start_idx = None;
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.cursor = valid_len;
+        Ok(None)
+    }
+}
+
+pub fn response_to_streaming_message<S>(
+    stream: S,
+) -> impl futures::Stream<
+    Item = anyhow::Result<(
+        Option<Message>,
+        Option<crate::providers::base::ProviderUsage>,
+    )>,
+> + 'static
+where
+    S: futures::Stream<Item = anyhow::Result<Bytes>> + Unpin + Send + 'static,
+{
+    use async_stream::try_stream;
+    use futures::{StreamExt, TryStreamExt};
+    use std::io;
+    use tokio_util::codec::FramedRead;
+    use tokio_util::io::StreamReader;
+
+    try_stream! {
+        let mut final_usage: Option<crate::providers::base::ProviderUsage> = None;
+        let mut last_signature: Option<String> = None;
+        let stream_id = Uuid::new_v4().to_string();
+
+        let stream_reader = StreamReader::new(stream.map_err(io::Error::other));
+        let mut framed = FramedRead::new(stream_reader, GoogleJsonDecoder::default());
+
+        while let Some(chunk_result) = framed.next().await {
+            let chunk: Value = match chunk_result {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Failed to parse streaming chunk: {}", e);
+                    continue;
+                }
+            };
+
+            if let Some(error) = chunk.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                let status = error
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("UNKNOWN");
+                Err(anyhow::anyhow!("Google API error ({}): {}", status, message))?;
+            }
+
+            if let Ok(usage) = get_usage(&chunk) {
+                if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                    let model = chunk.get("modelVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    final_usage = Some(crate::providers::base::ProviderUsage::new(model, usage));
+                }
+            }
+
+            let parts = chunk
+                .get("candidates")
+                .and_then(|v| v.as_array())
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("content"))
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array());
+
+            if let Some(parts) = parts {
+                for part in parts {
+                    if let Some(content) = process_response_part(part, &mut last_signature) {
+                        let message = Message::new(
+                            Role::Assistant,
+                            chrono::Utc::now().timestamp(),
+                            vec![content],
+                        ).with_id(stream_id.clone());
+                        yield (Some(message), None);
+                    }
+                }
+            }
+        }
+
+        if let Some(usage) = final_usage {
+            yield (None, Some(usage));
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TextPart<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct SystemInstruction<'a> {
+    parts: [TextPart<'a>; 1],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolsWrapper {
+    function_declarations: Vec<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<i32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleRequest<'a> {
+    system_instruction: SystemInstruction<'a>,
+    contents: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<ToolsWrapper>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>,
+}
+
 pub fn create_request(
     model_config: &ModelConfig,
     system: &str,
     messages: &[Message],
     tools: &[Tool],
 ) -> Result<Value> {
-    let mut payload = Map::new();
-    payload.insert(
-        "system_instruction".to_string(),
-        json!({"parts": [{"text": system}]}),
-    );
-    payload.insert("contents".to_string(), json!(format_messages(messages)));
-    if !tools.is_empty() {
-        payload.insert(
-            "tools".to_string(),
-            json!({"functionDeclarations": format_tools(tools)}),
-        );
-    }
-    let mut generation_config = Map::new();
-    if let Some(temp) = model_config.temperature {
-        generation_config.insert("temperature".to_string(), json!(temp as f64));
-    }
-    if let Some(tokens) = model_config.max_tokens {
-        generation_config.insert("maxOutputTokens".to_string(), json!(tokens));
-    }
-    if !generation_config.is_empty() {
-        payload.insert("generationConfig".to_string(), json!(generation_config));
-    }
+    let tools_wrapper = if tools.is_empty() {
+        None
+    } else {
+        Some(ToolsWrapper {
+            function_declarations: format_tools(tools),
+        })
+    };
 
-    Ok(json!(payload))
+    let generation_config =
+        if model_config.temperature.is_some() || model_config.max_tokens.is_some() {
+            Some(GenerationConfig {
+                temperature: model_config.temperature.map(|t| t as f64),
+                max_output_tokens: model_config.max_tokens,
+            })
+        } else {
+            None
+        };
+
+    let request = GoogleRequest {
+        system_instruction: SystemInstruction {
+            parts: [TextPart { text: system }],
+        },
+        contents: format_messages(messages),
+        tools: tools_wrapper,
+        generation_config,
+    };
+
+    Ok(serde_json::to_value(request)?)
 }
 
 #[cfg(test)]
@@ -1033,12 +1277,286 @@ mod tests {
         assert_eq!(google_out[0]["parts"][0]["thoughtSignature"], SIG);
         assert_eq!(google_out[1]["parts"][0]["thoughtSignature"], SIG);
 
-        let final_response =
+        // Text-only response WITH signature but WITHOUT function calls should be regular text
+        // (per original behavior: thinking is only when reasoning before tool calls)
+        let final_response_with_sig =
             google_response(vec![json!({"text": "Done!", "thoughtSignature": SIG})]);
-        let final_native = response_to_message(final_response).unwrap();
+        let final_native_with_sig = response_to_message(final_response_with_sig).unwrap();
         assert!(
-            final_native.content[0].as_text().is_some(),
-            "Text-only = final answer"
+            final_native_with_sig.content[0].as_text().is_some(),
+            "Text with signature but no function calls should be regular text (final response)"
         );
+
+        let final_response_no_sig = google_response(vec![json!({"text": "Done!"})]);
+        let final_native_no_sig = response_to_message(final_response_no_sig).unwrap();
+        assert!(
+            final_native_no_sig.content[0].as_text().is_some(),
+            "Text without signature is regular text"
+        );
+    }
+
+    fn bytes_stream(data: &str) -> impl futures::Stream<Item = anyhow::Result<Bytes>> {
+        futures::stream::iter(vec![Ok(Bytes::from(data.to_string()))])
+    }
+
+    const GOOGLE_TEXT_STREAM: &str = concat!(
+        r#"[{"candidates": [{"content": {"role": "model", "#,
+        r#""parts": [{"text": "Hello"}]}}]},"#,
+        r#"{"candidates": [{"content": {"role": "model", "#,
+        r#""parts": [{"text": " world"}]}}]},"#,
+        r#"{"candidates": [{"content": {"role": "model", "#,
+        r#""parts": [{"text": "!"}]}}], "#,
+        r#""usageMetadata": {"promptTokenCount": 10, "#,
+        r#""candidatesTokenCount": 3, "totalTokenCount": 13}}]"#
+    );
+
+    const GOOGLE_FUNCTION_STREAM: &str = concat!(
+        r#"[{"candidates": [{"content": {"role": "model", "#,
+        r#""parts": [{"functionCall": {"name": "test_tool", "#,
+        r#""args": {"param": "value"}}}]}}], "#,
+        r#""usageMetadata": {"promptTokenCount": 5, "#,
+        r#""candidatesTokenCount": 2, "totalTokenCount": 7}}]"#
+    );
+
+    #[tokio::test]
+    async fn test_streaming_text_response() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let stream = Box::pin(bytes_stream(GOOGLE_TEXT_STREAM));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+        let mut message_ids: Vec<Option<String>> = Vec::new();
+        let mut final_usage = None;
+
+        while let Some(result) = message_stream.next().await {
+            let (message, usage) = result?;
+            if let Some(msg) = message {
+                message_ids.push(msg.id.clone());
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+            if usage.is_some() {
+                final_usage = usage;
+            }
+        }
+
+        assert_eq!(text_parts, vec!["Hello", " world", "!"]);
+        let usage = final_usage.ok_or_else(|| anyhow::anyhow!("Missing usage"))?;
+        assert_eq!(usage.usage.input_tokens, Some(10));
+        assert_eq!(usage.usage.output_tokens, Some(3));
+
+        assert!(
+            message_ids.iter().all(|id| id.is_some()),
+            "All streaming messages should have an ID"
+        );
+        let first_id = message_ids
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No messages"))?;
+        assert!(
+            message_ids.iter().all(|id| id == first_id),
+            "All streaming messages should have the same ID"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_function_call() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let stream = Box::pin(bytes_stream(GOOGLE_FUNCTION_STREAM));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut tool_calls = Vec::new();
+
+        while let Some(result) = message_stream.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::ToolRequest(req)) = msg.content.first() {
+                    if let Ok(tool_call) = &req.tool_call {
+                        tool_calls.push(tool_call.name.to_string());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(tool_calls, vec!["test_tool"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_response() {
+        use futures::StreamExt;
+
+        let error_data = r#"[{"error": {"code": 400, "message": "Invalid request", "status": "INVALID_ARGUMENT"}}]"#;
+        let stream = Box::pin(bytes_stream(error_data));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let result = message_stream.next().await;
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(err.is_err());
+        let error_msg = err.unwrap_err().to_string();
+        assert!(error_msg.contains("INVALID_ARGUMENT"));
+        assert!(error_msg.contains("Invalid request"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunked_bytes() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let chunk1 = r#"[{"candidates": [{"content": {"role": "model", "parts": [{"text": "Hel"#;
+        let chunk2 = r#"lo"}]}}]},{"candidates": [{"content": {"role": "model", "parts": [{"text": " world"}]}}]}]"#;
+
+        let chunks: Vec<anyhow::Result<Bytes>> =
+            vec![Ok(Bytes::from(chunk1)), Ok(Bytes::from(chunk2))];
+        let stream = Box::pin(futures::stream::iter(chunks));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+
+        while let Some(result) = message_stream.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+        }
+
+        assert_eq!(text_parts, vec!["Hello", " world"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_split_utf8() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        // The character '🦀' is 4 bytes: [0xF0, 0x9F, 0xA6, 0x80]
+        let crab = "🦀";
+        let crab_bytes = crab.as_bytes();
+        assert_eq!(crab_bytes.len(), 4);
+
+        // Split the bytes across 3 chunks
+        // Chunk 1: JSON prefix + first byte of crab
+        let prefix = r#"{"candidates": [{"content": {"role": "model", "parts": [{"text": ""#;
+        let mut chunk1 = Bytes::from(prefix).to_vec();
+        chunk1.push(crab_bytes[0]);
+
+        // Chunk 2: next 2 bytes of crab
+        let chunk2 = vec![crab_bytes[1], crab_bytes[2]];
+
+        // Chunk 3: last byte of crab + JSON suffix
+        let mut chunk3 = Vec::new();
+        chunk3.push(crab_bytes[3]);
+        let suffix = r#""}]}}]}"#;
+        chunk3.extend_from_slice(suffix.as_bytes());
+
+        let chunks: Vec<anyhow::Result<Bytes>> = vec![
+            Ok(Bytes::from(chunk1)),
+            Ok(Bytes::from(chunk2)),
+            Ok(Bytes::from(chunk3)),
+        ];
+
+        let stream = Box::pin(futures::stream::iter(chunks));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+
+        while let Some(result) = message_stream.next().await {
+            let (message, _usage) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+        }
+
+        assert_eq!(text_parts.join(""), "🦀");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_multiple_objects() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let stream_data = concat!(
+            r#"[{"candidates": [{"content": {"role": "model", "#,
+            r#""parts": [{"text": "First"}]}}]},"#,
+            r#"{"candidates": [{"content": {"role": "model", "#,
+            r#""parts": [{"text": " Second"}]}}]},"#,
+            r#"{"candidates": [{"content": {"role": "model", "#,
+            r#""parts": [{"text": " Third"}]}}], "#,
+            r#""usageMetadata": {"promptTokenCount": 5, "#,
+            r#""candidatesTokenCount": 3, "totalTokenCount": 8}}]"#
+        );
+        let stream = Box::pin(bytes_stream(stream_data));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+        let mut final_usage = None;
+
+        while let Some(result) = message_stream.next().await {
+            let (message, usage) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+            if usage.is_some() {
+                final_usage = usage;
+            }
+        }
+
+        assert_eq!(text_parts, vec!["First", " Second", " Third"]);
+        let usage = final_usage.ok_or_else(|| anyhow::anyhow!("Missing usage"))?;
+        assert_eq!(usage.usage.input_tokens, Some(5));
+        assert_eq!(usage.usage.output_tokens, Some(3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_braces_in_string() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let stream_data = r#"[{"candidates": [{"content": {"role": "model", "parts": [{"text": "This has { braces } inside"}]}}]}]"#;
+        let stream = Box::pin(bytes_stream(stream_data));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+        while let Some(result) = message_stream.next().await {
+            let (message, _) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+        }
+
+        assert_eq!(text_parts, vec!["This has { braces } inside"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_escaped_quotes() -> anyhow::Result<()> {
+        use futures::StreamExt;
+
+        let stream_data = r#"[{"candidates": [{"content": {"role": "model", "parts": [{"text": "He said \"hello\" to me"}]}}]}]"#;
+        let stream = Box::pin(bytes_stream(stream_data));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut text_parts = Vec::new();
+        while let Some(result) = message_stream.next().await {
+            let (message, _) = result?;
+            if let Some(msg) = message {
+                if let Some(MessageContent::Text(text)) = msg.content.first() {
+                    text_parts.push(text.text.clone());
+                }
+            }
+        }
+
+        assert_eq!(text_parts, vec!["He said \"hello\" to me"]);
+        Ok(())
     }
 }
