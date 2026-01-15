@@ -1487,6 +1487,54 @@ fn handle_mcp_notification(
 ) {
     match notification {
         ServerNotification::LoggingMessageNotification(log_notif) => {
+            // Check for subagent notifications
+            if let Some(obj) = log_notif.params.data.as_object() {
+                // Render subagent tool requests as tool call headers
+                if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_tool_request") {
+                    if let (Some(subagent_id), Some(tool_call)) = (
+                        obj.get("subagent_id").and_then(|v| v.as_str()),
+                        obj.get("tool_call").and_then(|v| v.as_object()),
+                    ) {
+                        let tool_name = tool_call
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let arguments = tool_call
+                            .get("arguments")
+                            .and_then(|v| v.as_object())
+                            .cloned();
+
+                        if interactive {
+                            let _ = progress_bars.hide();
+                        }
+                        if !is_json_mode && !is_stream_json_mode {
+                            output::render_subagent_tool_call(
+                                subagent_id,
+                                tool_name,
+                                arguments.as_ref(),
+                            );
+                        }
+                        return;
+                    }
+                }
+
+                // Skip all other subagent notifications (don't display intermediate output)
+                if obj.get("subagent_id").is_some() {
+                    return;
+                }
+            }
+
+            // Skip notifications from subagent loggers
+            if log_notif
+                .params
+                .logger
+                .as_ref()
+                .map(|l| l.starts_with("subagent:"))
+                .unwrap_or(false)
+            {
+                return;
+            }
+
             let (formatted, subagent_id, notif_type) =
                 format_logging_notification(&log_notif.params.data, debug);
 

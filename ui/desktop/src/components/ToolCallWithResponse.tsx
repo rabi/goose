@@ -282,9 +282,38 @@ interface Progress {
   message?: string;
 }
 
+// Helper to format subagent tool calls nicely
+const formatSubagentToolCall = (data: Record<string, unknown>): string => {
+  const subagentId = data.subagent_id as string;
+  const toolCall = data.tool_call as { name: string; arguments?: Record<string, unknown> };
+
+  // Extract short ID (last part after underscore, e.g., "20260115_1" -> "1")
+  const shortId = subagentId?.split('_').pop() || subagentId;
+
+  // Parse tool name (e.g., "developer__shell" -> "shell | developer")
+  const parts = toolCall.name.split('__').reverse();
+  const toolName = parts[0] || 'unknown';
+  const extensionName = parts.slice(1).reverse().join('__') || '';
+
+  return extensionName
+    ? `[subagent:${shortId}] ${toolName} | ${extensionName}`
+    : `[subagent:${shortId}] ${toolName}`;
+};
+
 const logToString = (logMessage: NotificationEvent) => {
   const message = logMessage.message as { method: string; params: unknown };
   const params = message.params as Record<string, unknown>;
+
+  // Special case for subagent tool requests
+  if (
+    params &&
+    params.data &&
+    typeof params.data === 'object' &&
+    'type' in params.data &&
+    params.data.type === 'subagent_tool_request'
+  ) {
+    return formatSubagentToolCall(params.data as Record<string, unknown>);
+  }
 
   // Special case for the developer system shell logs
   if (

@@ -1,12 +1,18 @@
 use crate::{
     agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
-    conversation::{message::Message, Conversation},
+    conversation::{
+        message::{Message, MessageContent},
+        Conversation,
+    },
     prompt_template::render_global_file,
     recipe::Recipe,
 };
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use rmcp::model::{ErrorCode, ErrorData};
+use rmcp::model::{
+    ErrorCode, ErrorData, LoggingLevel, LoggingMessageNotification,
+    LoggingMessageNotificationMethod, LoggingMessageNotificationParam, ServerNotification,
+};
 use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,12 +21,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 #[derive(Serialize)]
-struct SubagentPromptContext {
-    max_turns: usize,
-    subagent_id: String,
-    task_instructions: String,
-    tool_count: usize,
-    available_tools: String,
+pub struct SubagentPromptContext {
+    pub max_turns: usize,
+    pub subagent_id: String,
+    pub task_instructions: String,
+    pub tool_count: usize,
+    pub available_tools: String,
 }
 
 type AgentMessagesFuture =
@@ -118,6 +124,111 @@ fn get_agent_messages(
     session_id: String,
     cancellation_token: Option<CancellationToken>,
 ) -> AgentMessagesFuture {
+    get_agent_messages_with_notifications(
+        config,
+        recipe,
+        task_config,
+        session_id,
+        cancellation_token,
+        None,
+    )
+}
+
+/// Standalone function to run a complete subagent task with notification forwarding
+pub async fn run_complete_subagent_task_with_notifications(
+    config: AgentConfig,
+    recipe: Recipe,
+    task_config: TaskConfig,
+    return_last_only: bool,
+    session_id: String,
+    cancellation_token: Option<CancellationToken>,
+    notification_tx: Option<tokio::sync::mpsc::UnboundedSender<rmcp::model::ServerNotification>>,
+) -> Result<String, anyhow::Error> {
+    let (messages, final_output) = get_agent_messages_with_notifications(
+        config,
+        recipe,
+        task_config,
+        session_id,
+        cancellation_token,
+        notification_tx,
+    )
+    .await
+    .map_err(|e| {
+        ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!("Failed to execute task: {}", e),
+            None,
+        )
+    })?;
+
+    if let Some(output) = final_output {
+        return Ok(output);
+    }
+
+    let response_text = if return_last_only {
+        messages
+            .messages()
+            .last()
+            .and_then(|message| {
+                message.content.iter().find_map(|content| match content {
+                    crate::conversation::message::MessageContent::Text(text_content) => {
+                        Some(text_content.text.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| String::from("No text content in last message"))
+    } else {
+        let all_text_content: Vec<String> = messages
+            .iter()
+            .flat_map(|message| {
+                message.content.iter().filter_map(|content| match content {
+                    crate::conversation::message::MessageContent::Text(text_content) => {
+                        Some(text_content.text.clone())
+                    }
+                    crate::conversation::message::MessageContent::ToolResponse(tool_response) => {
+                        if let Ok(result) = &tool_response.tool_result {
+                            let texts: Vec<String> = result
+                                .content
+                                .iter()
+                                .filter_map(|content| {
+                                    if let rmcp::model::RawContent::Text(raw_text_content) =
+                                        &content.raw
+                                    {
+                                        Some(raw_text_content.text.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if !texts.is_empty() {
+                                Some(format!("Tool result: {}", texts.join("\n")))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+
+        all_text_content.join("\n")
+    };
+
+    Ok(response_text)
+}
+
+fn get_agent_messages_with_notifications(
+    config: AgentConfig,
+    recipe: Recipe,
+    task_config: TaskConfig,
+    session_id: String,
+    cancellation_token: Option<CancellationToken>,
+    notification_tx: Option<tokio::sync::mpsc::UnboundedSender<rmcp::model::ServerNotification>>,
+) -> AgentMessagesFuture {
     Box::pin(async move {
         let system_instructions = recipe.instructions.clone().unwrap_or_default();
         let user_task = recipe
@@ -191,8 +302,22 @@ fn get_agent_messages(
         .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
         while let Some(message_result) = stream.next().await {
             match message_result {
-                Ok(AgentEvent::Message(msg)) => conversation.push(msg),
-                Ok(AgentEvent::McpNotification(_)) | Ok(AgentEvent::ModelChange { .. }) => {}
+                Ok(AgentEvent::Message(msg)) => {
+                    // Forward tool calls as logging notifications
+                    if let Some(ref tx) = notification_tx {
+                        for content in &msg.content {
+                            if let Some(notif) = create_tool_notification(content, &session_id) {
+                                let _ = tx.send(notif);
+                            }
+                        }
+                    }
+                    conversation.push(msg);
+                }
+                Ok(AgentEvent::McpNotification(_)) => {
+                    // Don't forward MCP notifications from subagents to avoid noisy output
+                    // (shell output, progress, etc.) - we only show tool call headers
+                }
+                Ok(AgentEvent::ModelChange { .. }) => {}
                 Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
                     conversation = updated_conversation;
                 }
@@ -216,4 +341,36 @@ fn get_agent_messages(
 
         Ok((conversation, final_output))
     })
+}
+
+/// Create a logging notification for tool requests to show in CLI
+fn create_tool_notification(
+    content: &MessageContent,
+    subagent_id: &str,
+) -> Option<ServerNotification> {
+    // Only forward tool requests, not responses (to avoid duplicate output)
+    if let MessageContent::ToolRequest(req) = content {
+        let tool_call = req.tool_call.as_ref().ok()?;
+
+        Some(ServerNotification::LoggingMessageNotification(
+            LoggingMessageNotification {
+                method: LoggingMessageNotificationMethod,
+                params: LoggingMessageNotificationParam {
+                    level: LoggingLevel::Info,
+                    logger: Some(format!("subagent:{}", subagent_id)),
+                    data: serde_json::json!({
+                        "type": "subagent_tool_request",
+                        "subagent_id": subagent_id,
+                        "tool_call": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments
+                        }
+                    }),
+                },
+                extensions: Default::default(),
+            },
+        ))
+    } else {
+        None
+    }
 }

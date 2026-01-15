@@ -574,6 +574,32 @@ fn render_default_request(call: &CallToolRequestParam, debug: bool) {
     println!();
 }
 
+/// Render a subagent tool call from notification data
+pub fn render_subagent_tool_call(
+    subagent_id: &str,
+    tool_name: &str,
+    _arguments: Option<&JsonObject>,
+) {
+    let parts: Vec<_> = tool_name.rsplit("__").collect();
+    // Session IDs are formatted as YYYYMMDD_N, extract just the suffix number
+    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+    let tool_header = format!(
+        "─── [subagent:{}] {} | {} ──────────────────────────",
+        short_id,
+        style(parts.first().unwrap_or(&"unknown")),
+        style(
+            parts
+                .split_first()
+                .map(|(_, s)| s.iter().rev().copied().collect::<Vec<_>>().join("__"))
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+        .magenta()
+        .dim(),
+    );
+    println!();
+    println!("{}", style(tool_header).cyan());
+}
+
 // Helper functions
 
 fn print_tool_header(call: &CallToolRequestParam) {
