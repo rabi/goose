@@ -12,6 +12,8 @@ months prior to the current date.
 You MUST use `code_execution__execute_code` to call other tools like developer, memory, etc.
 Do NOT call tools directly - use JavaScript code that imports and calls them.
 
+**IMPORTANT**: Call the `subagent` tool directly - do NOT use `code_execution__execute_code`, `code_execution__search_modules`, or `code_execution__read_module` to interact with the `subagent` tool.
+
 Example:
 ```javascript
 import { shell } from "developer";

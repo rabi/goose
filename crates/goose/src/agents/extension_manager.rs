@@ -1354,10 +1354,11 @@ impl ExtensionManager {
     }
 
     async fn get_server_client(&self, name: impl Into<String>) -> Option<McpClientBox> {
+        let normalized = normalize(&name.into());
         self.extensions
             .lock()
             .await
-            .get(&name.into())
+            .get(&normalized)
             .map(|ext| ext.get_client())
     }
 
