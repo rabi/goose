@@ -222,6 +222,10 @@ impl Agent {
             }
         };
 
+        // Clone values needed inside the stream
+        let toolshim_enabled = config.toolshim;
+        let toolshim_tools_clone = toolshim_tools.to_vec();
+
         // If there was an error creating the stream, return a stream that yields that error
         let mut stream = match stream_result {
             Ok(s) => s,
@@ -244,8 +248,10 @@ impl Agent {
                 }
 
                 // Post-process / structure the response only if tool interpretation is enabled
-                if message.is_some() && config.toolshim {
-                    message = Some(toolshim_postprocess(message.unwrap(), &toolshim_tools).await?);
+                if toolshim_enabled {
+                    if let Some(msg) = message {
+                        message = Some(toolshim_postprocess(msg, &toolshim_tools_clone).await?);
+                    }
                 }
 
                 yield (message, usage);
