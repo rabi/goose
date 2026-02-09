@@ -1,14 +1,19 @@
 use anyhow::Result;
+use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use rmcp::model::Role;
+use rmcp::model::{Role, Tool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use super::base::{ConfigKey, Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage};
+use super::base::{
+    stream_from_single_message, ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata,
+    ProviderUsage, Usage,
+};
 use super::errors::ProviderError;
 use super::utils::{filter_extensions_from_system_prompt, RequestLog};
 use crate::config::base::ClaudeCodeCommand;
@@ -17,7 +22,18 @@ use crate::config::{Config, GooseMode};
 use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
 use crate::subprocess::configure_subprocess;
-use rmcp::model::Tool;
+
+fn extract_usage_tokens(usage_info: &Value) -> (Option<i32>, Option<i32>) {
+    let input = usage_info
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i32::try_from(v).ok());
+    let output = usage_info
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i32::try_from(v).ok());
+    (input, output)
+}
 
 const CLAUDE_CODE_PROVIDER_NAME: &str = "claude-code";
 pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -29,22 +45,49 @@ struct CliProcess {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
-    #[allow(dead_code)]
     stderr_handle: tokio::task::JoinHandle<String>,
     messages_sent: usize,
+    needs_drain: bool,
+}
+
+impl CliProcess {
+    async fn drain_pending_response(&mut self) {
+        if !self.needs_drain {
+            return;
+        }
+        tracing::debug!("Draining cancelled response from CLI process");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match self.reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                        match parsed.get("type").and_then(|t| t.as_str()) {
+                            Some("result") | Some("error") => break,
+                            _ => continue,
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.needs_drain = false;
+        tracing::debug!("Drain complete, protocol re-synced");
+    }
 }
 
 impl Drop for CliProcess {
     fn drop(&mut self) {
+        self.stderr_handle.abort();
         let _ = self.child.start_kill();
     }
 }
 
-/// Spawns the Claude Code CLI (`claude`) as a persistent child process using
-/// `--input-format stream-json --output-format stream-json`. The CLI stays alive
-/// across turns, maintaining conversation state internally. Messages are sent as
-/// NDJSON on stdin with content arrays supporting text and image blocks. Responses
-/// are NDJSON on stdout (`assistant` + `result` events per turn).
 #[derive(Debug, serde::Serialize)]
 pub struct ClaudeCodeProvider {
     command: PathBuf,
@@ -52,7 +95,7 @@ pub struct ClaudeCodeProvider {
     #[serde(skip)]
     name: String,
     #[serde(skip)]
-    cli_process: tokio::sync::OnceCell<tokio::sync::Mutex<CliProcess>>,
+    cli_process: Arc<tokio::sync::Mutex<Option<CliProcess>>>,
 }
 
 impl ClaudeCodeProvider {
@@ -65,11 +108,10 @@ impl ClaudeCodeProvider {
             command: resolved_command,
             model,
             name: CLAUDE_CODE_PROVIDER_NAME.to_string(),
-            cli_process: tokio::sync::OnceCell::new(),
+            cli_process: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
-    /// Build Anthropic content blocks from goose messages, supporting text and images.
     fn messages_to_content_blocks(&self, messages: &[Message]) -> Vec<Value> {
         let mut blocks: Vec<Value> = Vec::new();
         for message in messages.iter().filter(|m| m.is_agent_visible()) {
@@ -139,14 +181,11 @@ impl ClaudeCodeProvider {
                         .to_string(),
                 ));
             }
-            GooseMode::Chat => {
-                // Chat mode doesn't need permission flags
-            }
+            GooseMode::Chat => {}
         }
         Ok(())
     }
 
-    /// Parse NDJSON stream-json response from Claude CLI
     fn parse_claude_response(
         &self,
         json_lines: &[String],
@@ -159,7 +198,6 @@ impl ClaudeCodeProvider {
                 match parsed.get("type").and_then(|t| t.as_str()) {
                     Some("assistant") => {
                         if let Some(message) = parsed.get("message") {
-                            // Extract text content from this assistant message
                             if let Some(content) = message.get("content").and_then(|c| c.as_array())
                             {
                                 for item in content {
@@ -170,70 +208,34 @@ impl ClaudeCodeProvider {
                                             all_text_content.push(text.to_string());
                                         }
                                     }
-                                    // Skip tool_use - those are claude CLI's internal tools
                                 }
                             }
 
-                            // Extract usage information
                             if let Some(usage_info) = message.get("usage") {
-                                usage.input_tokens = usage_info
-                                    .get("input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .map(|v| v as i32);
-                                usage.output_tokens = usage_info
-                                    .get("output_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .map(|v| v as i32);
-
-                                if usage.total_tokens.is_none() {
-                                    if let (Some(input), Some(output)) =
-                                        (usage.input_tokens, usage.output_tokens)
-                                    {
-                                        usage.total_tokens = Some(input + output);
-                                    }
-                                }
+                                let (input, output) = extract_usage_tokens(usage_info);
+                                usage = Usage::new(input, output, None);
                             }
                         }
                     }
                     Some("result") => {
-                        // Extract additional usage info from result if available
                         if let Some(result_usage) = parsed.get("usage") {
-                            if usage.input_tokens.is_none() {
-                                usage.input_tokens = result_usage
-                                    .get("input_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .map(|v| v as i32);
-                            }
-                            if usage.output_tokens.is_none() {
-                                usage.output_tokens = result_usage
-                                    .get("output_tokens")
-                                    .and_then(|v| v.as_i64())
-                                    .map(|v| v as i32);
-                            }
+                            let (input, output) = extract_usage_tokens(result_usage);
+                            usage = Usage::new(
+                                input.or(usage.input_tokens),
+                                output.or(usage.output_tokens),
+                                None,
+                            );
                         }
                     }
                     Some("error") => {
-                        let error_msg = parsed
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("Unknown error");
-                        if error_msg.contains("context") && error_msg.contains("exceeded") {
-                            return Err(ProviderError::ContextLengthExceeded(
-                                error_msg.to_string(),
-                            ));
-                        }
-                        return Err(ProviderError::RequestFailed(format!(
-                            "Claude CLI error: {}",
-                            error_msg
-                        )));
+                        return Err(error_from_event(&parsed));
                     }
-                    Some("system") => {} // Ignore system init events
-                    _ => {}              // Ignore other event types
+                    Some("system") => {}
+                    _ => {}
                 }
             }
         }
 
-        // Combine all text content into a single message
         let combined_text = all_text_content.join("\n\n");
         if combined_text.is_empty() {
             return Err(ProviderError::RequestFailed(
@@ -252,6 +254,76 @@ impl ClaudeCodeProvider {
         Ok((response_message, usage))
     }
 
+    fn spawn_process(&self, filtered_system: &str) -> Result<CliProcess, ProviderError> {
+        let mut cmd = Command::new(&self.command);
+        configure_subprocess(&mut cmd);
+        cmd.arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .arg("--include-partial-messages")
+            .arg("--system-prompt")
+            .arg(filtered_system);
+
+        if CLAUDE_CODE_KNOWN_MODELS.contains(&self.model.model_name.as_str()) {
+            cmd.arg("--model").arg(&self.model.model_name);
+        }
+
+        Self::apply_permission_flags(&mut cmd)?;
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            ProviderError::RequestFailed(format!(
+                "Failed to spawn Claude CLI command '{:?}': {}.",
+                self.command, e
+            ))
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProviderError::RequestFailed("Failed to capture stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProviderError::RequestFailed("Failed to capture stdout".to_string()))?;
+
+        // Drain stderr concurrently to prevent pipe buffer deadlock
+        let stderr = child.stderr.take();
+        let stderr_handle = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(mut stderr) = stderr {
+                use tokio::io::AsyncReadExt;
+                let _ = stderr.read_to_string(&mut output).await;
+            }
+            output
+        });
+
+        Ok(CliProcess {
+            child,
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr_handle,
+            messages_sent: 0,
+            needs_drain: false,
+        })
+    }
+
+    async fn ensure_process(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, Option<CliProcess>>,
+        filtered_system: &str,
+    ) -> Result<(), ProviderError> {
+        if guard.is_none() {
+            **guard = Some(self.spawn_process(filtered_system)?);
+        }
+        Ok(())
+    }
+
     async fn execute_command(
         &self,
         system: &str,
@@ -260,108 +332,22 @@ impl ClaudeCodeProvider {
     ) -> Result<Vec<String>, ProviderError> {
         let filtered_system = filter_extensions_from_system_prompt(system);
 
-        if std::env::var("GOOSE_CLAUDE_CODE_DEBUG").is_ok() {
-            println!("=== CLAUDE CODE PROVIDER DEBUG ===");
-            println!("Command: {:?}", self.command);
-            println!("Original system prompt length: {} chars", system.len());
-            println!(
-                "Filtered system prompt length: {} chars",
-                filtered_system.len()
-            );
-            println!("Filtered system prompt: {}", filtered_system);
-            println!("================================");
-        }
+        tracing::debug!(
+            command = ?self.command,
+            system_prompt_len = system.len(),
+            "Executing Claude CLI command"
+        );
 
-        // Spawn lazily on first call (OnceCell ensures exactly once)
-        let process_mutex = self
-            .cli_process
-            .get_or_try_init(|| async {
-                let mut cmd = Command::new(&self.command);
-                // NO -p flag — persistent mode
-                configure_subprocess(&mut cmd);
-                cmd.arg("--input-format")
-                    .arg("stream-json")
-                    .arg("--output-format")
-                    .arg("stream-json")
-                    .arg("--verbose")
-                    // System prompt is set once at process start. The provider
-                    // instance is not reused across sessions with different prompts.
-                    .arg("--system-prompt")
-                    .arg(&filtered_system);
+        let mut guard = self.cli_process.lock().await;
+        self.ensure_process(&mut guard, &filtered_system).await?;
 
-                // Only pass model parameter if it's in the known models list
-                if CLAUDE_CODE_KNOWN_MODELS.contains(&self.model.model_name.as_str()) {
-                    cmd.arg("--model").arg(&self.model.model_name);
-                }
-
-                // Add permission mode based on GOOSE_MODE setting
-                Self::apply_permission_flags(&mut cmd)?;
-
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                let mut child = cmd.spawn().map_err(|e| {
-                    ProviderError::RequestFailed(format!(
-                        "Failed to spawn Claude CLI command '{:?}': {}.",
-                        self.command, e
-                    ))
-                })?;
-
-                let stdin = child.stdin.take().ok_or_else(|| {
-                    ProviderError::RequestFailed("Failed to capture stdin".to_string())
-                })?;
-                let stdout = child.stdout.take().ok_or_else(|| {
-                    ProviderError::RequestFailed("Failed to capture stdout".to_string())
-                })?;
-
-                // Drain stderr concurrently to prevent pipe buffer deadlock
-                let stderr = child.stderr.take();
-                let stderr_handle = tokio::spawn(async move {
-                    let mut output = String::new();
-                    if let Some(mut stderr) = stderr {
-                        use tokio::io::AsyncReadExt;
-                        let _ = stderr.read_to_string(&mut output).await;
-                    }
-                    output
-                });
-
-                Ok::<_, ProviderError>(tokio::sync::Mutex::new(CliProcess {
-                    child,
-                    stdin,
-                    reader: BufReader::new(stdout),
-                    stderr_handle,
-                    messages_sent: 0,
-                }))
-            })
+        let process = guard.as_mut().unwrap();
+        process.drain_pending_response().await;
+        let already_sent = process.messages_sent;
+        self.send_turn(&mut process.stdin, messages, already_sent)
             .await?;
 
-        let mut process = process_mutex.lock().await;
-
-        // Build content from new messages only (skip already-sent ones).
-        // If messages is shorter than messages_sent, the caller started a fresh
-        // conversation on the same provider instance — send everything.
-        let new_messages = if process.messages_sent > 0 && process.messages_sent < messages.len() {
-            &messages[process.messages_sent..]
-        } else {
-            messages
-        };
-        let new_blocks = self.messages_to_content_blocks(new_messages);
-
-        // Write NDJSON line to stdin
-        let ndjson_line = build_stream_json_input(&new_blocks);
-        process
-            .stdin
-            .write_all(ndjson_line.as_bytes())
-            .await
-            .map_err(|e| {
-                ProviderError::RequestFailed(format!("Failed to write to stdin: {}", e))
-            })?;
-        process.stdin.write_all(b"\n").await.map_err(|e| {
-            ProviderError::RequestFailed(format!("Failed to write newline to stdin: {}", e))
-        })?;
-
-        // Read lines until we see a "result" event
+        let process = guard.as_mut().unwrap();
         let mut lines = Vec::new();
         let mut line = String::new();
 
@@ -369,7 +355,6 @@ impl ClaudeCodeProvider {
             line.clear();
             match process.reader.read_line(&mut line).await {
                 Ok(0) => {
-                    // EOF means the process died
                     return Err(ProviderError::RequestFailed(
                         "Claude CLI process terminated unexpectedly".to_string(),
                     ));
@@ -379,16 +364,18 @@ impl ClaudeCodeProvider {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    lines.push(trimmed.to_string());
 
-                    // Check if this is a result event (end of turn)
                     if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
                         match parsed.get("type").and_then(|t| t.as_str()) {
-                            Some("result") => break,
-                            Some("error") => break,
+                            Some("stream_event") => continue,
+                            Some("result") | Some("error") => {
+                                lines.push(trimmed.to_string());
+                                break;
+                            }
                             _ => {}
                         }
                     }
+                    lines.push(trimmed.to_string());
                 }
                 Err(e) => {
                     return Err(ProviderError::RequestFailed(format!(
@@ -399,23 +386,44 @@ impl ClaudeCodeProvider {
             }
         }
 
-        // Update messages_sent for next turn
         process.messages_sent = messages.len();
-
         tracing::debug!("Command executed successfully, got {} lines", lines.len());
-        for (i, line) in lines.iter().enumerate() {
-            tracing::debug!("Line {}: {}", i, line);
-        }
-
         Ok(lines)
     }
 
-    /// Generate a simple session description without calling subprocess
+    async fn send_turn(
+        &self,
+        stdin: &mut tokio::process::ChildStdin,
+        messages: &[Message],
+        messages_sent: usize,
+    ) -> Result<(), ProviderError> {
+        let new_messages = if messages_sent > 0 && messages_sent < messages.len() {
+            &messages[messages_sent..]
+        } else {
+            messages
+        };
+        let content_blocks = self.messages_to_content_blocks(new_messages);
+        let mut payload = build_stream_json_input(&content_blocks).into_bytes();
+        payload.push(b'\n');
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|e| ProviderError::RequestFailed(format!("Failed to write to stdin: {e}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| ProviderError::RequestFailed(format!("Failed to flush stdin: {e}")))?;
+        Ok(())
+    }
+
+    fn is_session_description_request(system: &str) -> bool {
+        system.contains("four words or less") || system.contains("4 words or less")
+    }
+
     fn generate_simple_session_description(
         &self,
         messages: &[Message],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        // Extract the first user message text
         let description = messages
             .iter()
             .find(|m| m.role == Role::User)
@@ -426,7 +434,6 @@ impl ClaudeCodeProvider {
                 })
             })
             .map(|text| {
-                // Take first few words, limit to 4 words
                 text.split_whitespace()
                     .take(4)
                     .collect::<Vec<_>>()
@@ -434,17 +441,15 @@ impl ClaudeCodeProvider {
             })
             .unwrap_or_else(|| "Simple task".to_string());
 
-        if std::env::var("GOOSE_CLAUDE_CODE_DEBUG").is_ok() {
-            println!("=== CLAUDE CODE PROVIDER DEBUG ===");
-            println!("Generated simple session description: {}", description);
-            println!("Skipped subprocess call for session description");
-            println!("================================");
-        }
+        tracing::debug!(
+            description = %description,
+            "Generated simple session description, skipped subprocess"
+        );
 
         let message = Message::new(
             Role::Assistant,
             chrono::Utc::now().timestamp(),
-            vec![MessageContent::text(description.clone())],
+            vec![MessageContent::text(description)],
         );
 
         let usage = Usage::default();
@@ -459,6 +464,18 @@ impl ClaudeCodeProvider {
 fn build_stream_json_input(content_blocks: &[Value]) -> String {
     let msg = json!({"type":"user","message":{"role":"user","content":content_blocks}});
     serde_json::to_string(&msg).expect("serializing JSON content blocks cannot fail")
+}
+
+fn error_from_event(parsed: &Value) -> ProviderError {
+    let error_msg = parsed
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("Unknown error");
+    if error_msg.contains("context") && error_msg.contains("exceeded") {
+        ProviderError::ContextLengthExceeded(error_msg.to_string())
+    } else {
+        ProviderError::RequestFailed(format!("Claude CLI error: {}", error_msg))
+    }
 }
 
 #[async_trait]
@@ -489,7 +506,6 @@ impl Provider for ClaudeCodeProvider {
     }
 
     fn get_model_config(&self) -> ModelConfig {
-        // Return the model config with appropriate context limit for Claude models
         self.model.clone()
     }
 
@@ -506,14 +522,13 @@ impl Provider for ClaudeCodeProvider {
     )]
     async fn complete_with_model(
         &self,
-        _session_id: Option<&str>, // create_session == YYYYMMDD_N, but --session-id requires a UUID
+        _session_id: Option<&str>,
         model_config: &ModelConfig,
         system: &str,
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        // Check if this is a session description request (short system prompt asking for 4 words or less)
-        if system.contains("four words or less") || system.contains("4 words or less") {
+        if Self::is_session_description_request(system) {
             return self.generate_simple_session_description(messages);
         }
 
@@ -521,7 +536,6 @@ impl Provider for ClaudeCodeProvider {
 
         let (message, usage) = self.parse_claude_response(&json_lines)?;
 
-        // Create a dummy payload for debug tracing
         let payload = json!({
             "command": self.command,
             "model": model_config.model_name,
@@ -542,6 +556,163 @@ impl Provider for ClaudeCodeProvider {
             ProviderUsage::new(model_config.model_name.clone(), usage),
         ))
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn stream(
+        &self,
+        _session_id: &str,
+        system: &str,
+        messages: &[Message],
+        _tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        if Self::is_session_description_request(system) {
+            let (message, usage) = self.generate_simple_session_description(messages)?;
+            return Ok(stream_from_single_message(message, usage));
+        }
+
+        let filtered_system = filter_extensions_from_system_prompt(system);
+        let process_arc = Arc::clone(&self.cli_process);
+
+        {
+            let mut guard = process_arc.lock().await;
+            self.ensure_process(&mut guard, &filtered_system).await?;
+            let process = guard.as_mut().unwrap();
+            process.drain_pending_response().await;
+            let already_sent = process.messages_sent;
+            self.send_turn(&mut process.stdin, messages, already_sent)
+                .await?;
+        }
+
+        let total_messages = messages.len();
+        let model_name = self.model.model_name.clone();
+        let message_id = uuid::Uuid::new_v4().to_string();
+
+        Ok(Box::pin(try_stream! {
+            let mut guard = Arc::clone(&process_arc).lock_owned().await;
+
+            if guard.is_none() {
+                Err(ProviderError::RequestFailed(
+                    "Claude CLI process not available".to_string(),
+                ))?;
+            }
+
+            let process = guard.as_mut().unwrap();
+            process.needs_drain = true;
+            let mut line = String::new();
+            let mut accumulated_usage = Usage::default();
+            let mut stream_error: Option<ProviderError> = None;
+            let stream_timestamp = chrono::Utc::now().timestamp();
+
+            loop {
+                line.clear();
+                match process.reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        process.needs_drain = false;
+                        stream_error = Some(ProviderError::RequestFailed(
+                            "Claude CLI process terminated unexpectedly".to_string(),
+                        ));
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                            match parsed.get("type").and_then(|t| t.as_str()) {
+                                Some("stream_event") => {
+                                    if let Some(event) = parsed.get("event") {
+                                        match event.get("type").and_then(|t| t.as_str()) {
+                                            Some("content_block_delta") => {
+                                                if let Some(text) = event
+                                                    .get("delta")
+                                                    .filter(|d| {
+                                                        d.get("type").and_then(|t| t.as_str())
+                                                            == Some("text_delta")
+                                                    })
+                                                    .and_then(|d| d.get("text"))
+                                                    .and_then(|t| t.as_str())
+                                                {
+                                                    let mut partial_message = Message::new(
+                                                        Role::Assistant,
+                                                        stream_timestamp,
+                                                        vec![MessageContent::text(text)],
+                                                    );
+                                                    partial_message.id =
+                                                        Some(message_id.clone());
+                                                    yield (Some(partial_message), None);
+                                                }
+                                            }
+                                            Some("message_start") => {
+                                                if let Some(usage_info) = event
+                                                    .get("message")
+                                                    .and_then(|m| m.get("usage"))
+                                                {
+                                                    let (input, _) =
+                                                        extract_usage_tokens(usage_info);
+                                                    if let Some(i) = input {
+                                                        accumulated_usage.input_tokens = Some(i);
+                                                    }
+                                                }
+                                            }
+                                            Some("message_delta") => {
+                                                if let Some(usage_info) = event.get("usage") {
+                                                    let (_, output) =
+                                                        extract_usage_tokens(usage_info);
+                                                    if let Some(o) = output {
+                                                        accumulated_usage.output_tokens = Some(o);
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Some("result") => {
+                                    process.needs_drain = false;
+                                    if let Some(usage_info) = parsed.get("usage") {
+                                        let (input, output) = extract_usage_tokens(usage_info);
+                                        accumulated_usage = Usage::new(
+                                            input.or(accumulated_usage.input_tokens),
+                                            output.or(accumulated_usage.output_tokens),
+                                            None,
+                                        );
+                                    }
+                                    break;
+                                }
+                                Some("error") => {
+                                    process.needs_drain = false;
+                                    stream_error = Some(error_from_event(&parsed));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        process.needs_drain = false;
+                        stream_error = Some(ProviderError::RequestFailed(format!(
+                            "Failed to read streaming output: {e}"
+                        )));
+                        break;
+                    }
+                }
+            }
+
+            guard.as_mut().unwrap().messages_sent = total_messages;
+
+            if let Some(err) = stream_error {
+                Err(err)?;
+            }
+
+            let provider_usage = ProviderUsage::new(model_name, accumulated_usage);
+            yield (None, Some(provider_usage));
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +720,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use test_case::test_case;
+
+    #[test_case(
+        json!({"input_tokens": 100, "output_tokens": 50}),
+        Some(100), Some(50)
+        ; "both_tokens"
+    )]
+    #[test_case(json!({"input_tokens": 100}), Some(100), None ; "input_only")]
+    #[test_case(json!({}), None, None ; "empty_usage")]
+    fn test_extract_usage_tokens(
+        usage_json: Value,
+        expected_input: Option<i32>,
+        expected_output: Option<i32>,
+    ) {
+        let (input, output) = extract_usage_tokens(&usage_json);
+        assert_eq!(input, expected_input);
+        assert_eq!(output, expected_output);
+    }
+
+    #[test_case(
+        r#"{"type":"error","error":"context window exceeded"}"#,
+        true
+        ; "context_exceeded"
+    )]
+    #[test_case(
+        r#"{"type":"error","error":"Model not supported"}"#,
+        false
+        ; "generic_error_from_event"
+    )]
+    #[test_case(r#"{"type":"error"}"#, false ; "missing_error_field")]
+    fn test_error_from_event(line: &str, is_context_exceeded: bool) {
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        let err = error_from_event(&parsed);
+        if is_context_exceeded {
+            assert!(matches!(err, ProviderError::ContextLengthExceeded(_)));
+        } else {
+            assert!(matches!(err, ProviderError::RequestFailed(_)));
+        }
+    }
 
     /// (role, text, optional (image_data, mime_type))
     type MsgSpec<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
@@ -698,6 +907,17 @@ mod tests {
         None, None
         ; "system_init_filtered"
     )]
+    #[test_case(
+        &[
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"He"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"llo"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}],"usage":{"input_tokens":50,"output_tokens":10}}}"#,
+            r#"{"type":"result","subtype":"success","result":"Hello","session_id":"abc"}"#,
+        ],
+        "Hello",
+        Some(50), Some(10)
+        ; "streaming_events_ignored_by_parse"
+    )]
     fn test_parse_claude_response_ok(
         lines: &[&str],
         expected_text: &str,
@@ -746,7 +966,7 @@ mod tests {
             command: PathBuf::from("claude"),
             model: ModelConfig::new("sonnet").unwrap(),
             name: "claude-code".to_string(),
-            cli_process: tokio::sync::OnceCell::new(),
+            cli_process: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
