@@ -717,6 +717,53 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
         config.set_gemini3_thinking_level(thinking_level)?;
     }
 
+    if model.to_lowercase().starts_with("claude-") {
+        let model_lower = model.to_lowercase();
+        let supports_adaptive = model_lower.starts_with("claude-opus-4-6")
+            || model_lower.starts_with("claude-sonnet-4-6");
+
+        let mut thinking_select = cliclack::select("Select extended thinking mode for Claude:");
+        if supports_adaptive {
+            thinking_select = thinking_select.item(
+                "adaptive",
+                "Adaptive - Claude decides when and how much to think (recommended)",
+                "",
+            );
+        }
+        thinking_select = thinking_select
+            .item("enabled", "Enabled - Fixed token budget for thinking", "")
+            .item("disabled", "Disabled - No extended thinking", "");
+        if supports_adaptive {
+            thinking_select = thinking_select.initial_value("adaptive");
+        } else {
+            thinking_select = thinking_select.initial_value("disabled");
+        }
+        let thinking_type: &str = thinking_select.interact()?;
+        config.set_claude_thinking_type(thinking_type)?;
+
+        if thinking_type == "adaptive" {
+            let effort: &str = cliclack::select("Select adaptive thinking effort level:")
+                .item("low", "Low - Minimal thinking, fastest responses", "")
+                .item("medium", "Medium - Moderate thinking", "")
+                .item("high", "High - Deep reasoning (default)", "")
+                .item(
+                    "max",
+                    "Max - No constraints on thinking depth (Opus 4.6 only)",
+                    "",
+                )
+                .initial_value("high")
+                .interact()?;
+            config.set_claude_thinking_effort(effort)?;
+        } else if thinking_type == "enabled" {
+            let budget: String = cliclack::input("Enter thinking budget (tokens):")
+                .default_input("16000")
+                .interact()?;
+            if let Ok(budget_tokens) = budget.parse::<i32>() {
+                config.set_claude_thinking_budget(budget_tokens)?;
+            }
+        }
+    }
+
     // Test the configuration
     let spin = spinner();
     spin.start("Checking your configuration...");

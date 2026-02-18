@@ -303,6 +303,11 @@ impl ModelConfig {
             })
     }
 
+    pub fn supports_adaptive_thinking(&self) -> bool {
+        self.model_name.starts_with("claude-opus-4-6")
+            || self.model_name.starts_with("claude-sonnet-4-6")
+    }
+
     pub fn new_or_fail(model_name: &str) -> ModelConfig {
         ModelConfig::new(model_name)
             .unwrap_or_else(|_| panic!("Failed to create model config for {}", model_name))

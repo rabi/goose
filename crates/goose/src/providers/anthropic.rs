@@ -25,6 +25,9 @@ const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-5";
 const ANTHROPIC_DEFAULT_FAST_MODEL: &str = "claude-haiku-4-5";
 const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
+    // Claude 4.6 models
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
     // Claude 4.5 models with aliases
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-20250929",
@@ -124,8 +127,13 @@ impl AnthropicProvider {
     fn get_conditional_headers(&self) -> Vec<(&str, &str)> {
         let mut headers = Vec::new();
 
-        let is_thinking_enabled = std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
         if self.model.model_name.starts_with("claude-3-7-sonnet-") {
+            let thinking_type = self
+                .model
+                .get_config_param::<String>("thinking_type", "claude_thinking_type")
+                .map(|s| s.to_lowercase());
+            let is_thinking_enabled = thinking_type.as_deref() == Some("enabled")
+                || std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
             if is_thinking_enabled {
                 headers.push(("anthropic-beta", "output-128k-2025-02-19"));
             }

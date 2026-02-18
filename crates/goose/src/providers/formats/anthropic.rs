@@ -384,6 +384,63 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
     }
 }
 
+fn get_thinking_type(model_config: &ModelConfig) -> String {
+    model_config
+        .get_config_param::<String>("thinking_type", "claude_thinking_type")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| {
+            if model_config.supports_adaptive_thinking() {
+                "adaptive".to_string()
+            } else if std::env::var("CLAUDE_THINKING_ENABLED").is_ok() {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        })
+}
+
+fn apply_thinking_config(payload: &mut Value, model_config: &ModelConfig, max_tokens: i32) {
+    match get_thinking_type(model_config).as_str() {
+        "adaptive" => {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("thinking".to_string(), json!({"type": "adaptive"}));
+
+            let effort = model_config
+                .get_config_param::<String>("effort", "claude_thinking_effort")
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| "high".to_string());
+
+            if matches!(effort.as_str(), "low" | "medium" | "high" | "max") {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("output_config".to_string(), json!({"effort": effort}));
+            }
+        }
+        "enabled" => {
+            let budget_tokens = model_config
+                .get_config_param::<i32>("budget_tokens", "claude_thinking_budget")
+                .unwrap_or(16000);
+
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("max_tokens".to_string(), json!(max_tokens + budget_tokens));
+
+            payload.as_object_mut().unwrap().insert(
+                "thinking".to_string(),
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens
+                }),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Create a complete request payload for Anthropic's API
 pub fn create_request(
     model_config: &ModelConfig,
@@ -427,25 +484,8 @@ pub fn create_request(
             .insert("temperature".to_string(), json!(temp));
     }
 
-    let is_thinking_enabled = std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
-    if is_thinking_enabled {
-        let budget_tokens = model_config
-            .get_config_param::<i32>("budget_tokens", "claude_thinking_budget")
-            .unwrap_or(16000);
+    apply_thinking_config(&mut payload, model_config, max_tokens);
 
-        payload
-            .as_object_mut()
-            .unwrap()
-            .insert("max_tokens".to_string(), json!(max_tokens + budget_tokens));
-
-        payload.as_object_mut().unwrap().insert(
-            "thinking".to_string(),
-            json!({
-                "type": "enabled",
-                "budget_tokens": budget_tokens
-            }),
-        );
-    }
     Ok(payload)
 }
 
