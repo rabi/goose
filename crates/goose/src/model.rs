@@ -284,6 +284,25 @@ impl ModelConfig {
         4_096
     }
 
+    /// Look up a parameter from request_params first, then fall back to config/env.
+    ///
+    /// Priority: request_params[request_key] → Config(config_key) → env var (CONFIG_KEY)
+    pub fn get_config_param<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        request_key: &str,
+        config_key: &str,
+    ) -> Option<T> {
+        self.request_params
+            .as_ref()
+            .and_then(|params| params.get(request_key))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .or_else(|| {
+                crate::config::Config::global()
+                    .get_param::<T>(config_key)
+                    .ok()
+            })
+    }
+
     pub fn new_or_fail(model_name: &str) -> ModelConfig {
         ModelConfig::new(model_name)
             .unwrap_or_else(|_| panic!("Failed to create model config for {}", model_name))

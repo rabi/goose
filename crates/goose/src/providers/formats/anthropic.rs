@@ -429,9 +429,8 @@ pub fn create_request(
 
     let is_thinking_enabled = std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
     if is_thinking_enabled {
-        let budget_tokens = std::env::var("CLAUDE_THINKING_BUDGET")
-            .unwrap_or_else(|_| "16000".to_string())
-            .parse()
+        let budget_tokens = model_config
+            .get_config_param::<i32>("budget_tokens", "claude_thinking_budget")
             .unwrap_or(16000);
 
         payload

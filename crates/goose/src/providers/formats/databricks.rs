@@ -613,10 +613,8 @@ pub fn create_request(
 
     let is_thinking_enabled = std::env::var("CLAUDE_THINKING_ENABLED").is_ok();
     if is_claude_sonnet && is_thinking_enabled {
-        // Minimum budget_tokens is 1024
-        let budget_tokens = std::env::var("CLAUDE_THINKING_BUDGET")
-            .unwrap_or_else(|_| "16000".to_string())
-            .parse()
+        let budget_tokens = model_config
+            .get_config_param::<i32>("budget_tokens", "claude_thinking_budget")
             .unwrap_or(16000);
 
         // For Claude models with thinking enabled, we need to add max_tokens + budget_tokens
