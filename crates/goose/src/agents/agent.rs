@@ -1223,12 +1223,10 @@ impl Agent {
                                     filtered_response,
                                 } = self.categorize_tools(&response, &tools).await;
 
-                                yield AgentEvent::Message(filtered_response.clone());
-                                tokio::task::yield_now().await;
-
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
                                 if num_tool_requests == 0 {
-                                    let text = filtered_response.as_concat_text();
+                                    yield AgentEvent::Message(response.clone());
+                                    let text = response.as_concat_text();
                                     if !text.is_empty() {
                                         last_assistant_text = text;
                                     }
@@ -1236,6 +1234,9 @@ impl Agent {
                                     conversation.push(response);
                                     continue;
                                 }
+
+                                yield AgentEvent::Message(filtered_response.clone());
+                                tokio::task::yield_now().await;
 
                                 let tool_response_messages: Vec<Arc<Mutex<Message>>> = (0..num_tool_requests)
                                     .map(|_| Arc::new(Mutex::new(Message::user().with_generated_id())))
