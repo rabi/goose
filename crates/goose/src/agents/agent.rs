@@ -873,6 +873,51 @@ impl Agent {
         false
     }
 
+    async fn apply_tool_pair_summary(
+        session_config: &SessionConfig,
+        session_manager: &SessionManager,
+        conversation: &mut Conversation,
+        summarization_task: tokio::task::JoinHandle<Option<(Message, String)>>,
+    ) -> Result<()> {
+        if let Ok(Some((summary_msg, tool_id))) = summarization_task.await {
+            let mut updated_messages = conversation.messages().clone();
+
+            let matching: Vec<&mut Message> = updated_messages
+                .iter_mut()
+                .filter(|msg| {
+                    msg.id.is_some()
+                        && msg.content.iter().any(|c| match c {
+                            MessageContent::ToolRequest(req) => req.id == tool_id,
+                            MessageContent::ToolResponse(resp) => resp.id == tool_id,
+                            _ => false,
+                        })
+                })
+                .collect();
+
+            if matching.len() == 2 {
+                for msg in matching {
+                    let id = msg.id.as_ref().unwrap();
+                    msg.metadata = msg.metadata.with_agent_invisible();
+                    SessionManager::update_message_metadata(&session_config.id, id, |metadata| {
+                        metadata.with_agent_invisible()
+                    })
+                    .await?;
+                }
+                *conversation = Conversation::new_unvalidated(updated_messages);
+                session_manager
+                    .add_message(&session_config.id, &summary_msg)
+                    .await?;
+                conversation.push(summary_msg);
+            } else {
+                warn!(
+                    "Expected a tool request/reply pair, but found {} matching messages",
+                    matching.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[instrument(
         skip(self, user_message, session_config),
         fields(user_message, trace_input)
@@ -1232,6 +1277,12 @@ impl Agent {
                                     }
                                     session_manager.add_message(&session_config.id, &response).await?;
                                     conversation.push(response);
+                                    Self::apply_tool_pair_summary(
+                                        &session_config,
+                                        &session_manager,
+                                        &mut conversation,
+                                        tool_pair_summarization_task,
+                                    ).await?;
                                     continue;
                                 }
 
@@ -1649,36 +1700,12 @@ impl Agent {
                     }
                 }
 
-                if let Ok(Some((summary_msg, tool_id))) = tool_pair_summarization_task.await {
-                    let mut updated_messages = conversation.messages().clone();
-
-                    let matching: Vec<&mut Message> = updated_messages
-                        .iter_mut()
-                        .filter(|msg| {
-                            msg.id.is_some() && msg.content.iter().any(|c| match c {
-                                MessageContent::ToolRequest(req) => req.id == tool_id,
-                                MessageContent::ToolResponse(resp) => resp.id == tool_id,
-                                _ => false,
-                            })
-                        })
-                        .collect();
-
-                    if matching.len() == 2 {
-                        for msg in matching {
-                            let id = msg.id.as_ref().unwrap();
-                            msg.metadata = msg.metadata.with_agent_invisible();
-                            SessionManager::update_message_metadata(&session_config.id, id, |metadata| {
-                                metadata.with_agent_invisible()
-                            }).await?;
-                        }
-                        conversation = Conversation::new_unvalidated(updated_messages);
-                        session_manager.add_message(&session_config.id, &summary_msg).await?;
-                        conversation.push(summary_msg);
-                    } else {
-                        warn!("Expected a tool request/reply pair, but found {} matching messages",
-                            matching.len());
-                    }
-                }
+                Self::apply_tool_pair_summary(
+                    &session_config,
+                    &session_manager,
+                    &mut conversation,
+                    tool_pair_summarization_task,
+                ).await?;
 
                 if exit_chat {
                     break;
