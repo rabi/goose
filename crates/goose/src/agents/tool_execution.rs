@@ -148,7 +148,7 @@ impl Agent {
                             // User declined - update the specific response message for this request
                             if let Some(response_msg) = request_to_response_map.get(&request.id) {
                                 let mut response = response_msg.lock().await;
-                                *response = response.clone().with_tool_response_with_metadata(
+                                response.add_tool_response_with_metadata(
                                     request.id.clone(),
                                     Ok(rmcp::model::CallToolResult::error(vec![Content::text(DECLINED_RESPONSE)])),
                                     request.metadata.as_ref(),
@@ -185,7 +185,7 @@ impl Agent {
 
                         if let Some((id, result)) = self.tool_result_rx.lock().await.recv().await {
                             let mut response = message_tool_response.lock().await;
-                            *response = response.clone().with_tool_response_with_metadata(
+                            response.add_tool_response_with_metadata(
                                 id,
                                 result,
                                 tool_request.metadata.as_ref(),

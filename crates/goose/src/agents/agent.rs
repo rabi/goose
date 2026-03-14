@@ -435,7 +435,7 @@ impl Agent {
         for request in &permission_check_result.denied {
             if let Some(response_msg) = request_to_response_map.get(&request.id) {
                 let mut response = response_msg.lock().await;
-                *response = response.clone().with_tool_response_with_metadata(
+                response.add_tool_response_with_metadata(
                     request.id.clone(),
                     Ok(CallToolResult::error(vec![rmcp::model::Content::text(
                         DECLINED_RESPONSE,
@@ -1315,7 +1315,7 @@ impl Agent {
                                     for request in remaining_requests.iter() {
                                         if let Some(response_msg) = request_to_response_map.get(&request.id) {
                                             let mut response = response_msg.lock().await;
-                                            *response = response.clone().with_tool_response_with_metadata(
+                                            response.add_tool_response_with_metadata(
                                                 request.id.clone(),
                                                 Ok(CallToolResult::success(vec![Content::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)])),
                                                 request.metadata.as_ref(),
@@ -1437,7 +1437,7 @@ impl Agent {
                                                                 if let Some(response_msg) = request_to_response_map.get(&request_id) {
                                                                     let metadata = request_metadata.get(&request_id).and_then(|m| m.as_ref());
                                                                     let mut response = response_msg.lock().await;
-                                                                    *response = response.clone().with_tool_response_with_metadata(request_id, output, metadata);
+                                                                    response.add_tool_response_with_metadata(request_id, output, metadata);
                                                                 }
                                                             }
                                                             ToolStreamItem::Message(msg) => {
