@@ -46,6 +46,7 @@ use crate::recipe::{Author, Recipe, Response, Settings};
 use crate::scheduler_trait::SchedulerTrait;
 use crate::security::adversary_inspector::AdversaryInspector;
 use crate::security::security_inspector::SecurityInspector;
+use crate::security::workspace_inspector::WorkspaceInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use crate::session::{Session, SessionManager};
 use crate::tool_inspection::ToolInspectionManager;
@@ -253,26 +254,22 @@ impl Agent {
         }
     }
 
-    /// Create a tool inspection manager with default inspectors
     fn create_tool_inspection_manager(
         permission_manager: Arc<PermissionManager>,
         provider: SharedProvider,
     ) -> ToolInspectionManager {
         let mut tool_inspection_manager = ToolInspectionManager::new();
 
-        // Add security inspector (highest priority - runs first)
+        // Inspector ordering matters: earlier inspectors can short-circuit later ones.
+        // Security (pattern scan) → Adversary (LLM-as-judge) → Workspace (path boundary)
+        // → Permission (user allow/deny rules) → Repetition (stuck-loop detection)
         tool_inspection_manager.add_inspector(Box::new(SecurityInspector::new()));
-
-        // Add adversary inspector (LLM-based review, enabled by ~/.config/goose/adversary.md)
         tool_inspection_manager.add_inspector(Box::new(AdversaryInspector::new(provider.clone())));
-
-        // Add permission inspector (medium-high priority)
+        tool_inspection_manager.add_inspector(Box::new(WorkspaceInspector));
         tool_inspection_manager.add_inspector(Box::new(PermissionInspector::new(
             permission_manager,
             provider,
         )));
-
-        // Add repetition inspector (lower priority - basic repetition checking)
         tool_inspection_manager.add_inspector(Box::new(RepetitionInspector::new(None)));
 
         tool_inspection_manager
@@ -1283,14 +1280,14 @@ impl Agent {
                                         }
                                     }
                                 } else {
-                                    // Run all tool inspectors
+                                    let inspection_ctx = crate::tool_inspection::InspectionContext::new(
+                                        &session_config.id,
+                                        &remaining_requests,
+                                        conversation.messages(),
+                                        goose_mode,
+                                    ).with_working_dir(&working_dir);
                                     let inspection_results = self.tool_inspection_manager
-                                        .inspect_tools(
-                                            &session_config.id,
-                                            &remaining_requests,
-                                            conversation.messages(),
-                                            goose_mode,
-                                        )
+                                        .inspect_tools(&inspection_ctx)
                                         .await?;
 
                                     let permission_check_result = self.tool_inspection_manager
@@ -2365,6 +2362,10 @@ mod tests {
         assert!(
             inspector_names.contains(&"adversary"),
             "Tool inspection manager should contain adversary inspector"
+        );
+        assert!(
+            inspector_names.contains(&"workspace"),
+            "Tool inspection manager should contain workspace inspector"
         );
 
         Ok(())

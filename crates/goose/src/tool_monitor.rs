@@ -1,11 +1,13 @@
-use crate::config::GooseMode;
-use crate::conversation::message::{Message, ToolRequest};
-use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspector};
+use std::collections::HashMap;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
 use serde_json::Value;
-use std::collections::HashMap;
+
+use crate::tool_inspection::{
+    InspectionAction, InspectionContext, InspectionResult, ToolInspector,
+};
 
 // Helper struct for internal tracking
 #[derive(Debug, Clone)]
@@ -96,17 +98,11 @@ impl ToolInspector for RepetitionInspector {
         self
     }
 
-    async fn inspect(
-        &self,
-        _session_id: &str,
-        tool_requests: &[ToolRequest],
-        _messages: &[Message],
-        _goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         let mut results = Vec::new();
 
         // Check repetition limits for each tool request
-        for tool_request in tool_requests {
+        for tool_request in ctx.tool_requests {
             if let Ok(tool_call) = &tool_request.tool_call {
                 // Create a temporary clone to check without modifying state
                 let mut temp_inspector = RepetitionInspector::new(self.max_repetitions);

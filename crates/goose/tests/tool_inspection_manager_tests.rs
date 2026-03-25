@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::config::GooseMode;
-use goose::conversation::message::{Message, ToolRequest};
 use goose::tool_inspection::{
-    InspectionAction, InspectionResult, ToolInspectionManager, ToolInspector,
+    InspectionAction, InspectionContext, InspectionResult, ToolInspectionManager, ToolInspector,
 };
 
 struct MockInspectorOk {
@@ -23,13 +22,7 @@ impl ToolInspector for MockInspectorOk {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    async fn inspect(
-        &self,
-        _session_id: &str,
-        _tool_requests: &[ToolRequest],
-        _messages: &[Message],
-        _goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, _ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         Ok(self.results.clone())
     }
 }
@@ -42,20 +35,13 @@ impl ToolInspector for MockInspectorErr {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    async fn inspect(
-        &self,
-        _session_id: &str,
-        _tool_requests: &[ToolRequest],
-        _messages: &[Message],
-        _goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, _ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         Err(anyhow!("simulated failure"))
     }
 }
 
 #[tokio::test]
 async fn test_inspect_tools_aggregates_and_handles_errors() {
-    // Arrange: create a manager with one successful and one failing inspector
     let ok_results = vec![
         InspectionResult {
             tool_request_id: "req_1".to_string(),
@@ -82,36 +68,23 @@ async fn test_inspect_tools_aggregates_and_handles_errors() {
     }));
     manager.add_inspector(Box::new(MockInspectorErr { name: "err" }));
 
-    // No specific input is required for this aggregation behavior
-    let tool_requests: Vec<ToolRequest> = vec![];
-    let messages: Vec<Message> = vec![];
+    let ctx = InspectionContext::new(
+        goose_test_support::TEST_SESSION_ID,
+        &[],
+        &[],
+        GooseMode::Approve,
+    );
 
-    // Act
     let results = manager
-        .inspect_tools(
-            goose_test_support::TEST_SESSION_ID,
-            &tool_requests,
-            &messages,
-            GooseMode::Approve,
-        )
+        .inspect_tools(&ctx)
         .await
         .expect("inspect_tools should not fail when one inspector errors");
 
-    // Assert: results from the successful inspector are returned; failing inspector is ignored
-    assert_eq!(
-        results.len(),
-        2,
-        "Should aggregate results from successful inspectors only"
-    );
-    // Also verify inspector_names() order/presence
-    let names = manager.inspector_names();
-    assert_eq!(
-        names,
-        vec!["ok", "err"],
-        "Inspector names should reflect registration order"
-    );
+    assert_eq!(results.len(), 2);
 
-    // Verify that specific actions are preserved
+    let names = manager.inspector_names();
+    assert_eq!(names, vec!["ok", "err"]);
+
     assert!(results
         .iter()
         .any(|r| matches!(r.action, InspectionAction::Allow)));

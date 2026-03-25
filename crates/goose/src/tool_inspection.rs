@@ -1,11 +1,42 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, ToolRequest};
 use crate::permission::permission_inspector::PermissionInspector;
 use crate::permission::permission_judge::PermissionCheckResult;
+
+pub struct InspectionContext<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) tool_requests: &'a [ToolRequest],
+    pub(crate) messages: &'a [Message],
+    pub(crate) goose_mode: GooseMode,
+    pub(crate) working_dir: Option<&'a Path>,
+}
+
+impl<'a> InspectionContext<'a> {
+    pub fn new(
+        session_id: &'a str,
+        tool_requests: &'a [ToolRequest],
+        messages: &'a [Message],
+        goose_mode: GooseMode,
+    ) -> Self {
+        Self {
+            session_id,
+            tool_requests,
+            messages,
+            goose_mode,
+            working_dir: None,
+        }
+    }
+
+    pub fn with_working_dir(mut self, working_dir: &'a Path) -> Self {
+        self.working_dir = Some(working_dir);
+        self
+    }
+}
 
 /// Result of inspecting a tool call
 #[derive(Debug, Clone)]
@@ -36,13 +67,7 @@ pub trait ToolInspector: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Inspect tool requests and return results
-    async fn inspect(
-        &self,
-        session_id: &str,
-        tool_requests: &[ToolRequest],
-        messages: &[Message],
-        goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>>;
+    async fn inspect(&self, ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>>;
 
     /// Whether this inspector is enabled
     fn is_enabled(&self) -> bool {
@@ -74,10 +99,7 @@ impl ToolInspectionManager {
     /// Run all inspectors on the tool requests
     pub async fn inspect_tools(
         &self,
-        session_id: &str,
-        tool_requests: &[ToolRequest],
-        messages: &[Message],
-        goose_mode: GooseMode,
+        ctx: &InspectionContext<'_>,
     ) -> Result<Vec<InspectionResult>> {
         let mut all_results = Vec::new();
 
@@ -88,14 +110,11 @@ impl ToolInspectionManager {
 
             tracing::debug!(
                 inspector_name = inspector.name(),
-                tool_count = tool_requests.len(),
+                tool_count = ctx.tool_requests.len(),
                 "Running tool inspector"
             );
 
-            match inspector
-                .inspect(session_id, tool_requests, messages, goose_mode)
-                .await
-            {
+            match inspector.inspect(ctx).await {
                 Ok(results) => {
                     tracing::debug!(
                         inspector_name = inspector.name(),

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::config::GooseMode;
-use crate::conversation::message::{Message, ToolRequest};
 use crate::security::{SecurityManager, SecurityResult};
-use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspector};
+use crate::tool_inspection::{
+    InspectionAction, InspectionContext, InspectionResult, ToolInspector,
+};
 
 /// Security inspector that uses pattern matching to detect malicious tool calls
 pub struct SecurityInspector {
@@ -56,16 +56,10 @@ impl ToolInspector for SecurityInspector {
         self
     }
 
-    async fn inspect(
-        &self,
-        _session_id: &str,
-        tool_requests: &[ToolRequest],
-        messages: &[Message],
-        _goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         let security_results = self
             .security_manager
-            .analyze_tool_requests(tool_requests, messages)
+            .analyze_tool_requests(ctx.tool_requests, ctx.messages)
             .await?;
 
         // Convert security results to inspection results
@@ -96,6 +90,7 @@ impl Default for SecurityInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GooseMode;
     use crate::conversation::message::ToolRequest;
     use rmcp::model::CallToolRequestParams;
     use rmcp::object;
@@ -113,10 +108,8 @@ mod tests {
             tool_meta: None,
         }];
 
-        let results = inspector
-            .inspect("test", &tool_requests, &[], GooseMode::Approve)
-            .await
-            .unwrap();
+        let ctx = InspectionContext::new("test", &tool_requests, &[], GooseMode::Approve);
+        let results = inspector.inspect(&ctx).await.unwrap();
 
         // Results depend on whether security is enabled in config
         if inspector.is_enabled() {

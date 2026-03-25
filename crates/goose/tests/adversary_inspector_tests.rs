@@ -1,7 +1,7 @@
 use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageContent, ToolRequest};
 use goose::security::adversary_inspector::AdversaryInspector;
-use goose::tool_inspection::ToolInspector;
+use goose::tool_inspection::{InspectionContext, ToolInspector};
 use rmcp::model::CallToolRequestParams;
 use rmcp::object;
 use std::sync::Arc;
@@ -25,6 +25,10 @@ fn write_adversary_md(dir: &std::path::Path, content: &str) {
     std::fs::write(dir.join("adversary.md"), content).unwrap();
 }
 
+fn make_context<'a>(requests: &'a [ToolRequest], messages: &'a [Message]) -> InspectionContext<'a> {
+    InspectionContext::new("test-session", requests, messages, GooseMode::SmartApprove)
+}
+
 #[tokio::test]
 async fn test_adversary_disabled_without_config_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -35,17 +39,13 @@ async fn test_adversary_disabled_without_config_file() {
     assert_eq!(inspector.name(), "adversary");
     assert!(!inspector.is_enabled());
 
+    let requests = [make_request(
+        "r1",
+        "shell",
+        object!({"command": "rm -rf /"}),
+    )];
     let results = inspector
-        .inspect(
-            "test-session",
-            &[make_request(
-                "r1",
-                "shell",
-                object!({"command": "rm -rf /"}),
-            )],
-            &[],
-            GooseMode::SmartApprove,
-        )
+        .inspect(&make_context(&requests, &[]))
         .await
         .unwrap();
 
@@ -69,17 +69,13 @@ async fn test_adversary_enabled_default_tools() {
     )];
 
     // shell is reviewed by default — no provider means fail-open (Allow)
+    let requests = [make_request(
+        "r1",
+        "shell",
+        object!({"command": "cargo build"}),
+    )];
     let results = inspector
-        .inspect(
-            "test-session",
-            &[make_request(
-                "r1",
-                "shell",
-                object!({"command": "cargo build"}),
-            )],
-            &messages,
-            GooseMode::SmartApprove,
-        )
+        .inspect(&make_context(&requests, &messages))
         .await
         .unwrap();
 
@@ -90,17 +86,13 @@ async fn test_adversary_enabled_default_tools() {
     ));
 
     // write is NOT reviewed by default — skipped entirely
+    let requests = [make_request(
+        "r1",
+        "write",
+        object!({"path": "foo.txt", "content": "hi"}),
+    )];
     let results = inspector
-        .inspect(
-            "test-session",
-            &[make_request(
-                "r1",
-                "write",
-                object!({"path": "foo.txt", "content": "hi"}),
-            )],
-            &messages,
-            GooseMode::SmartApprove,
-        )
+        .inspect(&make_context(&requests, &messages))
         .await
         .unwrap();
 
@@ -127,46 +119,28 @@ async fn test_adversary_custom_tool_filter() {
     )];
 
     // shell — reviewed
-    let results = inspector
-        .inspect(
-            "test",
-            &[make_request("r1", "shell", object!({"command": "ls"}))],
-            &messages,
-            GooseMode::Auto,
-        )
-        .await
-        .unwrap();
+    let requests = [make_request("r1", "shell", object!({"command": "ls"}))];
+    let c = InspectionContext::new("test", &requests, &messages, GooseMode::Auto);
+    let results = inspector.inspect(&c).await.unwrap();
     assert_eq!(results.len(), 1);
 
     // automation_script — reviewed
-    let results = inspector
-        .inspect(
-            "test",
-            &[make_request(
-                "r2",
-                "computercontroller__automation_script",
-                object!({"script": "echo hi", "language": "shell"}),
-            )],
-            &messages,
-            GooseMode::Auto,
-        )
-        .await
-        .unwrap();
+    let requests = [make_request(
+        "r2",
+        "computercontroller__automation_script",
+        object!({"script": "echo hi", "language": "shell"}),
+    )];
+    let c = InspectionContext::new("test", &requests, &messages, GooseMode::Auto);
+    let results = inspector.inspect(&c).await.unwrap();
     assert_eq!(results.len(), 1);
 
     // write — NOT reviewed
-    let results = inspector
-        .inspect(
-            "test",
-            &[make_request(
-                "r3",
-                "write",
-                object!({"path": "x.txt", "content": "y"}),
-            )],
-            &messages,
-            GooseMode::Auto,
-        )
-        .await
-        .unwrap();
+    let requests = [make_request(
+        "r3",
+        "write",
+        object!({"path": "x.txt", "content": "y"}),
+    )];
+    let c = InspectionContext::new("test", &requests, &messages, GooseMode::Auto);
+    let results = inspector.inspect(&c).await.unwrap();
     assert!(results.is_empty());
 }

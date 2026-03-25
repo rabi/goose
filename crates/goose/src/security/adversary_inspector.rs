@@ -1,14 +1,16 @@
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use std::sync::OnceLock;
 
 use crate::agents::types::SharedProvider;
 use crate::config::paths::Paths;
-use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
-use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspector};
+use crate::tool_inspection::{
+    InspectionAction, InspectionContext, InspectionResult, ToolInspector,
+};
 use crate::utils::safe_truncate;
 
 const DEFAULT_TOOLS: &[&str] = &["shell", "computercontroller__automation_script"];
@@ -356,25 +358,19 @@ impl ToolInspector for AdversaryInspector {
         self.get_config().is_some()
     }
 
-    async fn inspect(
-        &self,
-        _session_id: &str,
-        tool_requests: &[ToolRequest],
-        messages: &[Message],
-        _goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         let config = match self.get_config() {
             Some(c) => c,
             None => return Ok(vec![]),
         };
 
-        let original_task = Self::extract_original_task(messages);
+        let original_task = Self::extract_original_task(ctx.messages);
         let recent_messages =
-            Self::extract_recent_user_messages(messages, MAX_RECENT_USER_MESSAGES);
+            Self::extract_recent_user_messages(ctx.messages, MAX_RECENT_USER_MESSAGES);
 
         let mut results = Vec::new();
 
-        for request in tool_requests {
+        for request in ctx.tool_requests {
             if !Self::should_review(config, request) {
                 continue;
             }
@@ -450,6 +446,7 @@ impl ToolInspector for AdversaryInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GooseMode;
     use rmcp::model::CallToolRequestParams;
     use rmcp::object;
     use std::sync::Arc;
@@ -621,10 +618,9 @@ mod tests {
             tool_meta: None,
         };
 
-        let results = inspector
-            .inspect("test", &[request], &[], GooseMode::Auto)
-            .await
-            .unwrap();
+        let requests = [request];
+        let ctx = InspectionContext::new("test", &requests, &[], GooseMode::Auto);
+        let results = inspector.inspect(&ctx).await.unwrap();
         assert!(results.is_empty());
     }
 }

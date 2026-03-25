@@ -1,13 +1,16 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use rmcp::model::Tool;
+
 use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::types::SharedProvider;
 use crate::config::permission::PermissionLevel;
 use crate::config::{GooseMode, PermissionManager};
-use crate::conversation::message::{Message, ToolRequest};
+use crate::conversation::message::ToolRequest;
 use crate::permission::permission_judge::{detect_read_only_tools, PermissionCheckResult};
-use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspector};
-use anyhow::Result;
-use async_trait::async_trait;
-use rmcp::model::Tool;
+use crate::tool_inspection::{
+    InspectionAction, InspectionContext, InspectionResult, ToolInspector,
+};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
@@ -121,18 +124,13 @@ impl ToolInspector for PermissionInspector {
         self
     }
 
-    async fn inspect(
-        &self,
-        session_id: &str,
-        tool_requests: &[ToolRequest],
-        _messages: &[Message],
-        goose_mode: GooseMode,
-    ) -> Result<Vec<InspectionResult>> {
+    async fn inspect(&self, ctx: &InspectionContext<'_>) -> Result<Vec<InspectionResult>> {
         let mut results = Vec::new();
         let permission_manager = &self.permission_manager;
         let mut llm_detect_candidates: Vec<&ToolRequest> = Vec::new();
+        let goose_mode = ctx.goose_mode;
 
-        for request in tool_requests {
+        for request in ctx.tool_requests {
             if let Ok(tool_call) = &request.tool_call {
                 let tool_name = &tool_call.name;
 
@@ -213,7 +211,7 @@ impl ToolInspector for PermissionInspector {
         if !llm_detect_candidates.is_empty() {
             let detected: HashSet<String> = match self.provider.lock().await.clone() {
                 Some(provider) => {
-                    detect_read_only_tools(provider, session_id, llm_detect_candidates.to_vec())
+                    detect_read_only_tools(provider, ctx.session_id, llm_detect_candidates.to_vec())
                         .await
                         .into_iter()
                         .collect()
@@ -298,10 +296,9 @@ mod tests {
             metadata: None,
             tool_meta: None,
         };
-        let results = inspector
-            .inspect(goose_test_support::TEST_SESSION_ID, &[req], &[], mode)
-            .await
-            .unwrap();
+        let requests = [req];
+        let ctx = InspectionContext::new(goose_test_support::TEST_SESSION_ID, &requests, &[], mode);
+        let results = inspector.inspect(&ctx).await.unwrap();
         assert_eq!(results[0].action, expected);
     }
 }
